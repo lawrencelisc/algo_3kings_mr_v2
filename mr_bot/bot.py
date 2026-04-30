@@ -144,7 +144,7 @@ class BotConfig:
     # 幣池篩選
     hurst_threshold: float = 0.45
     hl_slack: float = 1.5
-    coin_rescreen_interval_bars: int = 200  # 每 200 bars 重新 screen 一次
+    coin_rescreen_interval_bars: int = 30   # 每 30 bars 重新 screen（120s bar → 60min）
 
     # Timeout（分 bar 計）
     timeout_bars: int = 30
@@ -408,16 +408,6 @@ class MeanReversionBot:
         # Drawdown throttle：連虧保護
         if self.dd_throttle.is_throttled:
             logger.info("DD_THROTTLE  %s  %s", symbol, self.dd_throttle.status_str())
-
-        # TP distance check（必須 > breakeven）
-        tp_dist_bps = abs(self.config.z_tp - z) / max(abs(z), 0.01) * abs(z) * 100
-        # 簡化：TP 係 kalman fair value，dist = |mp - fair_value|
-        fair_val = state.kalman.fair_value or mp
-        tp_dist_abs = abs(mp - fair_val)
-        tp_dist_bps_real = tp_dist_abs / max(mp, 1e-9) * 1e4
-        if tp_dist_bps_real < self.config.min_tp_bps:
-            logger.debug("SKIP %s %s tp_dist=%.1f bps < min %.1f bps", side.upper(), symbol, tp_dist_bps_real, self.config.min_tp_bps)
-            return
 
         # Limit order fill simulation（用 microprice 附近掛單）
         limit_price = mp
