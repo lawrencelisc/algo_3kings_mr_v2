@@ -324,11 +324,12 @@ def warmup_symbol(
     prices_cache: Dict[str, List[float]],
     ohlcv_cache: Dict[str, List],
     config: BotConfig,
-) -> None:
+) -> bool:
     """
     拉 600 根歷史 bar replay 進 bot，warm up Kalman / VPIN / VolBurst / Hurst。
     prices_for_screen=None → 唔觸發 eligibility → 唔會產生假交易。
     Replay 後手動 screen_coin 設定初始 eligibility。
+    返回 True = 成功，False = 失敗（幣唔存在 / 資料不足）。
     """
     logger.info("Warm-up  %-22s  fetching 600 bars …", sym)
     try:
@@ -336,11 +337,11 @@ def warmup_symbol(
         time.sleep(0.8)
     except Exception as _e:
         logger.warning("Warm-up fetch error %s: %s — skipped", sym, _e)
-        return
+        return False
 
     if len(wu_ohlcv) < 50:
         logger.warning("Warm-up skip %s — only %d bars", sym, len(wu_ohlcv))
-        return
+        return False
 
     ohlcv_cache[sym] = wu_ohlcv
     if sym not in prices_cache:
@@ -380,11 +381,16 @@ def warmup_symbol(
         )
 
     # 手動 screen，設定初始 eligibility
+    # warm-up 用 1m bar replay，half_life_ou 返回「1m bars」數（即分鐘）。
+    # 但 config.timeout_bars 係以 bar_duration_sec 為單位（e.g. 3m bar）。
+    # 必須換算：timeout_1m = timeout_bars × (bar_duration_sec / 60)
+    # 例：20 bars × (180s / 60) = 60 1m bars；cap = 60 × 1.5 = 90 分鐘
+    _timeout_1m = max(1, int(config.timeout_bars * (config.bar_duration_sec / 60.0)))
     _st = bot.get_state(sym)
     if len(prices_cache[sym]) >= 50:
         _res = screen_coin(
             prices=prices_cache[sym],
-            timeout_bars=config.timeout_bars,
+            timeout_bars=_timeout_1m,
             hurst_threshold=config.hurst_threshold,
             hl_slack=config.hl_slack,
         )
@@ -399,6 +405,7 @@ def warmup_symbol(
         f"{_st.hurst_val:.3f}" if _st.hurst_val is not None else "None",
         f"{_st.half_life_bars:.1f}" if _st.half_life_bars is not None else "None",
     )
+    return True
 
 
 # ── fetch_one helper ──────────────────────────────────────────────────────────
@@ -495,9 +502,18 @@ def main() -> None:
 
     # ── Warm-up ─────────────────────────────────────────────────────────────
     logger.info("━━━ WARM-UP START — 歷史 bar replay，請稍候 ━━━")
+    failed_syms: List[str] = []
     for sym in symbols:
-        warmup_symbol(bot, ex, sym, liq_trackers, prices_cache, ohlcv_cache, config)
-    logger.info("━━━ WARM-UP COMPLETE — bot ready to trade ━━━")
+        ok = warmup_symbol(bot, ex, sym, liq_trackers, prices_cache, ohlcv_cache, config)
+        if not ok:
+            failed_syms.append(sym)
+    if failed_syms:
+        logger.warning(
+            "Warm-up: %d symbols unavailable on Hyperliquid → removed: %s",
+            len(failed_syms), failed_syms,
+        )
+        symbols = [s for s in symbols if s not in failed_syms]
+    logger.info("━━━ WARM-UP COMPLETE — %d symbols active, bot ready to trade ━━━", len(symbols))
 
     last_universe_scan_ts = time.time()
 
@@ -521,8 +537,10 @@ def main() -> None:
 
                 if added:
                     logger.info("Universe: adding %d new symbols: %s", len(added), added)
-                    for sym in added:
-                        warmup_symbol(bot, ex, sym, liq_trackers, prices_cache, ohlcv_cache, config)
+                    added = [s for s in added
+                             if warmup_symbol(bot, ex, s, liq_trackers, prices_cache, ohlcv_cache, config)]
+                    if added:
+                        logger.info("Universe: %d symbols warmed-up successfully", len(added))
 
                 if removed:
                     logger.info(
