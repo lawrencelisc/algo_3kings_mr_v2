@@ -3,10 +3,20 @@ core/risk.py — Portfolio-level risk controls
 
 兩個獨立 guard，每 bar 都要 update：
 
-  CorrelationGuard
-    追蹤各幣種 rolling log-return，入場前 check：
-      1. 新幣 vs 任何已持倉幣的 pairwise corr 超過 threshold → block
-      2. 全組合平均 corr 超過 avg_threshold → block（隱性集中風險）
+  CorrelationGuard（side-aware）
+    追蹤各幣種 rolling log-return，入場前 check「方向性集中風險」：
+      effective directional corr：
+        same side（兩邊都 long 或都 short）  → eff_c = +ρ
+        opposite side（一 long 一 short）    → eff_c = −ρ
+      解釋：對住已 long 嘅倉，新 long 同 corr=0.7 = 真集中（eff=+0.7 → block）；
+            新 short 同 corr=0.7 = 對沖（eff=−0.7 → 唔 block，反而減 portfolio risk）。
+
+      Rules：
+        1. 任一已持倉幣，eff_c ≥ threshold → block（單筆方向性集中）
+        2. 對所有「正向 contribution」（eff_c > 0）求平均，≥ avg_threshold → block
+
+      呢個改法解決：46 隻高度相關 crypto perp 入面，舊版只用 |ρ| 會將
+      hedge trade 都當成集中風險，令第二單之後幾乎冇可能入場。
 
   DrawdownThrottle
     監控最近 window_sec 秒的 equity drawdown。
@@ -28,10 +38,16 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 class CorrelationGuard:
     """
-    防止隱性集中風險（同方向高度相關幣種同時持倉）。
+    防止「方向性集中風險」（同方向高度相關幣種同時持倉）。
 
     每 bar 呼叫 update(symbol, close)。
-    入場前呼叫 check_entry(symbol, held_symbols)。
+    入場前呼叫 check_entry(symbol, new_side, held_positions)。
+
+    Side-aware 邏輯：
+      effective_corr = +ρ  if 同方向（long+long 或 short+short）
+                     = −ρ  if 反方向（long+short）
+      block 條件 = eff_c ≥ threshold（單筆）或 平均正向 eff_c ≥ avg_threshold。
+      反方向高 ρ → eff_c 變負 → 永遠唔 block（因為實際係對沖）。
     """
 
     def __init__(
@@ -76,33 +92,55 @@ class CorrelationGuard:
     def check_entry(
         self,
         symbol: str,
-        held_symbols: List[str],
+        new_side: str,
+        held_positions: Dict[str, str],
     ) -> Tuple[bool, str]:
         """
-        返回 (blocked, reason)。
-        blocked=True 代表唔應該開倉。
+        Side-aware entry check。
+
+        Parameters
+        ----------
+        symbol : str
+            想入場嘅幣。
+        new_side : "long" | "short"
+            想入場嘅方向。
+        held_positions : Dict[symbol, side]
+            已持倉嘅 {幣 → 方向}。空 dict = 無倉。
+
+        Returns
+        -------
+        (blocked, reason)
+            blocked=True 代表「方向性集中風險過高」，唔應該開倉。
+            反方向 hedge（new_side 同 held_side 唔同）會令 eff_c = −ρ，
+            屬於 risk-reducing trade，永遠唔 block。
         """
-        if not held_symbols:
+        if not held_positions:
             return False, ""
 
-        corrs = []
-        for held in held_symbols:
+        dir_corrs: List[float] = []
+        for held, held_side in held_positions.items():
             if held == symbol:
                 continue
             c = self._corr(symbol, held)
             if c is None:
                 continue
-            if abs(c) >= self._threshold:
-                return True, (
-                    f"pairwise corr({symbol},{held})={c:.2f} >= {self._threshold}"
-                )
-            corrs.append(abs(c))
+            same_dir = (new_side == held_side)
+            eff_c = c if same_dir else -c
 
-        if corrs:
-            avg_c = sum(corrs) / len(corrs)
+            if eff_c >= self._threshold:
+                return True, (
+                    f"directional corr({symbol}/{new_side},{held}/{held_side})"
+                    f"={eff_c:+.2f} >= {self._threshold}"
+                )
+            if eff_c > 0:
+                dir_corrs.append(eff_c)
+
+        if dir_corrs:
+            avg_c = sum(dir_corrs) / len(dir_corrs)
             if avg_c >= self._avg_threshold:
                 return True, (
-                    f"avg portfolio corr={avg_c:.2f} >= {self._avg_threshold}"
+                    f"avg directional corr={avg_c:+.2f} >= {self._avg_threshold}"
+                    f" (n_same_dir={len(dir_corrs)})"
                 )
 
         return False, ""

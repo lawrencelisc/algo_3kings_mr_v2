@@ -454,6 +454,11 @@ def main() -> None:
     universe_relax_hurst = float(os.environ.get("MR_UNIVERSE_RELAX_HURST", "0.55"))
     universe_min_atr_bps = float(os.environ.get("MR_UNIVERSE_MIN_ATR_BPS", "8"))
 
+    # Align live screen_coin VR threshold with universe scan's relax threshold.
+    # 之前 universe scan relaxed 用 VR<relax_hurst×2.0 揀池，但 live 每 30 bars
+    # re-screen 用 BotConfig.hurst_threshold=0.45 → VR<0.90 strict，導致
+    # universe relaxed 揀返嚟嘅幣即時被打成 eligible=False，永遠唔開倉。
+    # 直接將 relax 值傳落 BotConfig，兩邊用同一道閘。
     config = BotConfig(
         initial_equity=equity,
         z_entry_long=-z_entry,
@@ -462,6 +467,11 @@ def main() -> None:
         atr_mult=atr_mult,
         bar_duration_sec=poll_sec,
         csv_path=csv_path,
+        hurst_threshold=universe_relax_hurst,
+    )
+    logger.info(
+        "VR threshold aligned: screen_coin uses VR<%.2f (from MR_UNIVERSE_RELAX_HURST=%.2f)",
+        universe_relax_hurst * 2.0, universe_relax_hurst,
     )
     bot = MeanReversionBot(config)
     ex  = _make_exchange()

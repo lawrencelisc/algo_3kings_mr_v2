@@ -189,6 +189,11 @@ class BotConfig:
     csv_path: str = "mr_trades.csv"
     log_diag_every_bars: int = 50
 
+    # Gate funnel diagnostic：每 N 個 global bar（= sum of on_bar across symbols）
+    # print 一次入場漏斗統計，方便睇邊道閘 reject 最多。
+    # 預設 200：例如 8 隻幣 × 25 bars/symbol ≈ 25 分鐘（poll=60s）一次。
+    gate_log_every_bars: int = 200
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # CSV Output
@@ -237,6 +242,24 @@ class MeanReversionBot:
     Live 版：將 step 6-7 嘅 account.close/open 換成 ex.create_order()。
     """
 
+    # Gate funnel keys（按入場路徑順序）：
+    #   bars         on_bar 進入次數
+    #   considered   未持倉，會考慮入場嘅 bar 數
+    #   g1_z         Kalman z 已 warm up
+    #   g2_eligible  screen_coin 通過（VR + HL）
+    #   g3_regime    regime != RED
+    #   g4_z_thresh  |z| 達到 z_entry
+    #   g5_no_cd     冇 SL cooldown
+    #   g6_corr      side-aware CorrelationGuard 通過
+    #   g7_fill      simulate_limit_fill 成功
+    #   g8_notional  sizing > 0
+    #   opens        實際開倉
+    _GATE_KEYS = (
+        "bars", "considered", "g1_z", "g2_eligible", "g3_regime",
+        "g4_z_thresh", "g5_no_cd", "g6_corr", "g7_fill", "g8_notional",
+        "opens",
+    )
+
     def __init__(self, config: BotConfig) -> None:
         self.config = config
         self.fee_model = FeeModel()
@@ -253,6 +276,9 @@ class MeanReversionBot:
         self.dd_throttle = DrawdownThrottle(
             window_sec=config.dd_window_sec, dd_limit=config.dd_limit
         )
+
+        # Gate funnel counters（reset 每次 _log_gate_diag 之後）
+        self._gate_stats: Dict[str, int] = {k: 0 for k in self._GATE_KEYS}
 
         logger.info(
             "MeanReversionBot initialized  equity=%.2f  "
@@ -357,31 +383,38 @@ class MeanReversionBot:
                 sell_flow=sell_flow,
             )
 
-        # 7. 入場
-        if (
-            not state.in_position
-            and z is not None
-            and state.eligible
-            and regime_zone != RegimeZone.RED
-        ):
-            self._try_entry(
-                state=state,
-                symbol=symbol,
-                close=close,
-                mp=mp,
-                bid=bid,
-                ask=ask,
-                bid_levels=bid_levels,
-                ask_levels=ask_levels,
-                z=float(z),
-                atr=atr,
-                vpin_pct=vpin_pct,
-                regime_zone=regime_zone,
-            )
+        # 7. 入場（funnel 同時 count 每道閘）
+        self._gate_stats["bars"] += 1
+        if not state.in_position:
+            self._gate_stats["considered"] += 1
+            if z is not None:
+                self._gate_stats["g1_z"] += 1
+                if state.eligible:
+                    self._gate_stats["g2_eligible"] += 1
+                    if regime_zone != RegimeZone.RED:
+                        self._gate_stats["g3_regime"] += 1
+                        self._try_entry(
+                            state=state,
+                            symbol=symbol,
+                            close=close,
+                            mp=mp,
+                            bid=bid,
+                            ask=ask,
+                            bid_levels=bid_levels,
+                            ask_levels=ask_levels,
+                            z=float(z),
+                            atr=atr,
+                            vpin_pct=vpin_pct,
+                            regime_zone=regime_zone,
+                        )
 
         # 8. Diag log
         if self._global_bar % self.config.log_diag_every_bars == 0:
             self._log_diag(symbol, state, z, regime_zone, regime_reason, vpin_pct, vol_ratio)
+
+        # 8b. Gate funnel diag（reset window 之後再起跳）
+        if self._global_bar % self.config.gate_log_every_bars == 0:
+            self._log_gate_diag()
 
         return closed_rec
 
@@ -409,21 +442,29 @@ class MeanReversionBot:
             side = "short"
         if side is None:
             return
+        self._gate_stats["g4_z_thresh"] += 1
 
         # SL 冷卻期：止損後唔可以即刻重入（防接刀 / 連輸）
         if state.bar_count < state.sl_cooldown_until_bar:
-            logger.debug(
-                "SL_COOLDOWN  %s  bars_left=%d",
+            logger.info(
+                "SL_COOLDOWN  %s  bars_left=%d  (re-entry blocked)",
                 symbol, state.sl_cooldown_until_bar - state.bar_count,
             )
             return
+        self._gate_stats["g5_no_cd"] += 1
 
-        # Correlation cap：防止隱性集中風險
-        held_symbols = [s for s, st in self._states.items() if st.in_position]
-        corr_blocked, corr_reason = self.corr_guard.check_entry(symbol, held_symbols)
+        # Correlation cap：side-aware（反方向高 ρ 視為對沖，唔 block）
+        held_positions = {
+            s: st.position_side for s, st in self._states.items()
+            if st.in_position and st.position_side
+        }
+        corr_blocked, corr_reason = self.corr_guard.check_entry(
+            symbol, side, held_positions
+        )
         if corr_blocked:
             logger.info("CORR_BLOCK  %s %s  %s", side.upper(), symbol, corr_reason)
             return
+        self._gate_stats["g6_corr"] += 1
 
         # Drawdown throttle：連虧保護
         if self.dd_throttle.is_throttled:
@@ -434,6 +475,7 @@ class MeanReversionBot:
         fill_price, is_maker = simulate_limit_fill(side, limit_price, bid_levels, ask_levels)
         if fill_price is None:
             return
+        self._gate_stats["g7_fill"] += 1
 
         # Base SL distance（bps-clamped ATR，自適應跨幣種）
         # raw_sl_bps = atr_mult × ATR / price × 1e4
@@ -470,6 +512,7 @@ class MeanReversionBot:
         ) * self.dd_throttle.size_multiplier
         if notional <= 0:
             return
+        self._gate_stats["g8_notional"] += 1
 
         size = notional / max(fill_price, 1e-9)
         # size_mult 記錄
@@ -495,6 +538,7 @@ class MeanReversionBot:
         state.notional = notional
         state.size_mult = size_mult
         state.adverse_flow.reset()
+        self._gate_stats["opens"] += 1
 
         logger.info(
             "OPEN  %s %s  fill=%.4f  TP=%.4f  SL=%.4f  "
@@ -662,6 +706,41 @@ class MeanReversionBot:
             self.account.equity,
             self.account.total_fee_paid,
         )
+
+    def gate_stats_snapshot(self) -> Dict[str, int]:
+        """返回當前 gate funnel counter 嘅 copy（唔 reset）。"""
+        return dict(self._gate_stats)
+
+    def _log_gate_diag(self) -> None:
+        """
+        Print 入場漏斗統計，然後 reset window。
+        Funnel：bars → considered → G1 → G2 → G3 → G4 → G5 → G6 → G7 → G8 → opens
+        每個 stage 嘅 % 係 conditional on 上一 stage 通過。
+        """
+        s = self._gate_stats
+
+        def pct(num: int, den: int) -> str:
+            return f"{num / den * 100:5.1f}%" if den > 0 else "  ---"
+
+        logger.info(
+            "GATE_DIAG  bars=%d  considered=%d (%s)  "
+            "G1_z=%d (%s)  G2_eligible=%d (%s)  G3_regime=%d (%s)  "
+            "G4_|z|>=%.2f=%d (%s)  G5_no_cd=%d (%s)  G6_corr=%d (%s)  "
+            "G7_fill=%d (%s)  G8_notional=%d (%s)  → OPEN=%d",
+            s["bars"], s["considered"], pct(s["considered"], s["bars"]),
+            s["g1_z"], pct(s["g1_z"], s["considered"]),
+            s["g2_eligible"], pct(s["g2_eligible"], s["g1_z"]),
+            s["g3_regime"], pct(s["g3_regime"], s["g2_eligible"]),
+            self.config.z_entry_short,
+            s["g4_z_thresh"], pct(s["g4_z_thresh"], s["g3_regime"]),
+            s["g5_no_cd"], pct(s["g5_no_cd"], s["g4_z_thresh"]),
+            s["g6_corr"], pct(s["g6_corr"], s["g5_no_cd"]),
+            s["g7_fill"], pct(s["g7_fill"], s["g6_corr"]),
+            s["g8_notional"], pct(s["g8_notional"], s["g7_fill"]),
+            s["opens"],
+        )
+
+        self._gate_stats = {k: 0 for k in self._GATE_KEYS}
 
     def summary(self) -> dict:
         return self.account.summary()
