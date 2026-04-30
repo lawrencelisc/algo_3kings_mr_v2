@@ -402,14 +402,17 @@ def warmup_symbol(
 
 
 # ── fetch_one helper ──────────────────────────────────────────────────────────
+# Main loop 只需最新幾根 bar 計 ATR + 最新 close/volume。
+# 歷史 600 bars 已喺 warm-up 階段拉咗，主循環唔需要重複拉。
+# limit=20 足以計 ATR(14)（需要 15+ bars），且速度提升 ~30x vs limit=600。
 
 def _fetch_one(ex: ccxt.Exchange, sym: str) -> Optional[Dict]:
     for attempt in range(4):
         try:
-            ohlcv  = [list(x) for x in ex.fetch_ohlcv(sym, "1m", limit=600)]
-            time.sleep(0.3)
+            ohlcv  = [list(x) for x in ex.fetch_ohlcv(sym, "1m", limit=20)]
+            time.sleep(0.2)
             ticker = ex.fetch_ticker(sym)
-            time.sleep(0.3)
+            time.sleep(0.2)
             ob     = ex.fetch_order_book(sym, 5)
             return {"sym": sym, "ohlcv": ohlcv, "ticker": ticker, "ob": ob}
         except Exception as e:
@@ -551,12 +554,27 @@ def main() -> None:
             if not data:
                 continue
 
-            ohlcv  = data["ohlcv"]
+            fresh  = data["ohlcv"]   # 最新 20 bars（from _fetch_one limit=20）
             ticker = data["ticker"]
             ob     = data["ob"]
-            ohlcv_cache[sym] = ohlcv
 
-            if len(ohlcv) < 50:
+            if not fresh:
+                continue
+
+            # 把新 bars merge 進 ohlcv_cache（warm-up 已有 600 bars，直接 append）
+            cached = ohlcv_cache.get(sym, [])
+            if cached:
+                last_ts = cached[-1][0]
+                new_bars = [b for b in fresh if b[0] > last_ts]
+                cached.extend(new_bars)
+                if len(cached) > 700:
+                    cached = cached[-700:]
+            else:
+                cached = fresh
+            ohlcv_cache[sym] = cached
+
+            ohlcv = cached   # 用完整歷史計 ATR（warm-up 後有 600+ bars）
+            if len(ohlcv) < 5:
                 continue
 
             bar    = ohlcv[-1]
