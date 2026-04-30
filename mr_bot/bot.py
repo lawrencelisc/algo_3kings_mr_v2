@@ -170,6 +170,10 @@ class BotConfig:
     # Sizing
     sizing_config: SizingConfig = field(default_factory=SizingConfig)
 
+    # ROUND3: size_mult 硬上限（防止 Kelly 估計誤差在樣本少時放大虧損）
+    # 建議初期用 2.0-3.0，跑夠 100 筆後可放寬到 5.0
+    max_size_mult: float = 3.0
+
     # Bar duration（秒）
     bar_duration_sec: float = 60.0
 
@@ -549,6 +553,20 @@ class MeanReversionBot:
         # size_mult 記錄
         base_notional = self.account.equity * self.config.sizing_config.min_fraction
         size_mult = notional / max(base_notional, 1e-9)
+
+        # ── ROUND3: size_mult 硬上限 ──────────────────────────────────────
+        # Quarter-Kelly 在樣本少時估計誤差極大，初期大倉會嚴重放大虧損
+        # 硬 cap = 3.0×（允許 Kelly 放大，但防止極端情況）
+        # 可用 MR_MAX_SIZE_MULT 環境變數調整
+        _max_mult = getattr(self.config, "max_size_mult", 3.0)
+        if size_mult > _max_mult:
+            notional = base_notional * _max_mult
+            size = notional / max(fill_price, 1e-9)
+            size_mult = _max_mult
+            logger.debug(
+                "SIZE_MULT CAP  %s  capped to %.1f×  notional=%.2f",
+                symbol, _max_mult, notional,
+            )
 
         # 扣開倉手續費
         entry_fee = self.account.deduct_entry_fee(notional, is_maker=is_maker)

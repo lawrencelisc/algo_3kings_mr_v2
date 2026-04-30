@@ -71,6 +71,8 @@ import numpy as np
 from mr_bot.bot import MeanReversionBot, BotConfig
 from mr_bot.core.indicators import microprice, variance_ratio, half_life_ou
 from mr_bot.core.regime import screen_coin
+from mr_bot.core.cooldown import CooldownManager
+from mr_bot.core.risk import CorrelationGuard, DrawdownThrottle
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -836,6 +838,7 @@ def main() -> None:
         bar_duration_sec=poll_sec,
         csv_path=csv_path,
         hurst_threshold=universe_relax_hurst,
+        max_size_mult=float(os.environ.get("MR_MAX_SIZE_MULT", "3.0")),
         sizing_config=_SizingConfig(
             min_fraction=min_fraction,
             max_fraction=max_fraction,
@@ -852,6 +855,28 @@ def main() -> None:
         equity * min_fraction, equity * max_fraction,
     )
     bot = MeanReversionBot(config)
+
+    # ── Risk Controls ────────────────────────────────────────────────────────
+    corr_guard = CorrelationGuard(
+        window=int(os.environ.get("MR_CORR_WINDOW", "200")),
+        threshold=float(os.environ.get("MR_CORR_THRESHOLD", "0.6")),
+        avg_threshold=float(os.environ.get("MR_CORR_AVG_THRESHOLD", "0.5")),
+    )
+    dd_throttle = DrawdownThrottle(
+        window_sec=float(os.environ.get("MR_DD_WINDOW_SEC", "3600")),
+        dd_limit=float(os.environ.get("MR_DD_LIMIT", "0.005")),
+        throttle_mult=float(os.environ.get("MR_DD_THROTTLE_MULT", "0.5")),
+    )
+
+    # ── Cooldown Manager ────────────────────────────────────────────────────
+    cooldown_path = os.environ.get("MR_COOLDOWN_FILE", "cooldown_state.json")
+    cooldown = CooldownManager(
+        cooldown_hours=float(os.environ.get("MR_COOLDOWN_HOURS", "4.0")),
+        max_sl_in_24h=int(os.environ.get("MR_COOLDOWN_MAX_SL", "2")),
+        state_path=cooldown_path,
+    )
+    # 重啟時顯示 cooldown 狀態，讓交易者知道哪些幣種在坐監
+    cooldown.log_status()
     ex  = _make_exchange()
     ex.load_markets()
 
@@ -1008,6 +1033,24 @@ def main() -> None:
             buy_flow  = volume * 0.5 * (1 + (1 if price_chg > 0 else -1) * 0.3)
             sell_flow = volume - buy_flow
 
+            # ── Cooldown check（入場前）────────────────────────────────────
+            # 不影響已有持倉管理，只阻止開新倉
+            _st_cd = bot.get_state(sym)
+            if not _st_cd.in_position and cooldown.is_cooling(sym):
+                rem_h = cooldown.remaining_sec(sym) / 3600
+                logger.info(
+                    "COOLDOWN  %s  skip entry (剩 %.1fh  24h_SL=%d)",
+                    sym, rem_h, cooldown.sl_count_24h(sym),
+                )
+                # 仍要繼續 on_bar 管理已有持倉（不 continue）
+
+            # ── CorrelationGuard（入場前）──────────────────────────────────
+            # 更新 rolling return（持倉中的幣都要 update）
+            corr_guard.update(sym, close)
+
+            # ── DrawdownThrottle 更新 ───────────────────────────────────────
+            dd_throttle.update(bot.account.equity)
+
             # Snapshot 入場前持倉狀態，用嚟偵測新開倉
             _st_before = bot.get_state(sym)
             _was_in_pos = _st_before.in_position
@@ -1023,6 +1066,17 @@ def main() -> None:
                 prices_for_screen=prices_cache[sym] if len(prices_cache[sym]) >= 200 else None,
             )
 
+            # ── SL → 觸發 cooldown ──────────────────────────────────────────
+            if rec is not None and rec.reason == "SL":
+                triggered = cooldown.record_sl(sym)
+                if triggered:
+                    # 在坐監列表中顯示
+                    rem_h = cooldown.remaining_sec(sym) / 3600
+                    logger.warning(
+                        "🚫 %s 進入 cooldown %.1fh（24h 第 %d 次 SL）",
+                        sym, rem_h, cooldown.sl_count_24h(sym),
+                    )
+
             if not paper:
                 _st_after = bot.get_state(sym)
 
@@ -1037,12 +1091,16 @@ def main() -> None:
         # ── Summary（每 10 分鐘）────────────────────────────────────────────
         if int(loop_start) % 600 < int(poll_sec):
             s = bot.summary()
+            cooling_list = cooldown.all_cooling()
             logger.info(
                 "SUMMARY  equity=%.2f  pnl=%+.4f  trades=%d  "
-                "win_rate=%.1f%%  PF=%.3f  fee_paid=%.4f",
+                "win_rate=%.1f%%  PF=%.3f  fee_paid=%.4f  "
+                "dd=%s  cooling=%s",
                 s["equity"], s["pnl"], s["trades"],
                 s.get("win_rate", 0), s.get("profit_factor", 0),
                 s.get("total_fee_paid", 0),
+                dd_throttle.status_str(),
+                cooling_list if cooling_list else "none",
             )
 
         # ── Sleep ────────────────────────────────────────────────────────────

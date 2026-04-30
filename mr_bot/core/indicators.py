@@ -329,11 +329,9 @@ class VPIN:
         # Bulk Volume Classification：用 return sign 估 buy fraction
         ret = close - self._prev_close
         sigma_ret = 1e-6  # 防止 div/0，後面會動態更新
-        if len(self._history) >= 2:
+        if self._history:
             arr = np.array(list(self._history)[-50:])
-            diffs = np.diff(arr)
-            if len(diffs) >= 2:
-                sigma_ret = max(float(np.std(diffs, ddof=1)), 1e-6)
+            sigma_ret = max(float(np.std(np.diff(arr))), 1e-6)
 
         # buy fraction = Φ(return / sigma)（常態分佈 CDF）
         z = ret / sigma_ret
