@@ -452,66 +452,108 @@ def _live_min_check(ex: ccxt.Exchange, symbol: str, size: float, notional: float
     return True
 
 
-def _live_place_entry(ex: ccxt.Exchange, symbol: str, state) -> None:  # type: ignore[no-untyped-def]
+def _live_place_entry(
+    ex: ccxt.Exchange,
+    symbol: str,
+    state,  # type: ignore[no-untyped-def]
+    ob_bids: Optional[List] = None,
+    ob_asks: Optional[List] = None,
+) -> None:
     """
     Bot 剛剛虛擬開倉，mirror 到真實交易所。
-    state.position_side = "long" | "short"
-    state.entry_price   = 目標掛單價（bot 嘅 microprice fill 估算）
-    state.size          = 合約數量（base asset unit）
-    state.notional      = 名義金額（USDT）
+
+    入場策略（用最新 5 層 OB 決定）：
+
+      LONG（買貨）→ 直接 IOC market @ best_ask
+        理由：price 已超賣，需要快手搶入，唔等 maker。
+
+      SHORT（賣貨）→ 先睇 5 層 bid 深度：
+        bid depth（5層）≥ 我們嘅 notional  → 嘗試 postOnly limit @ best_ask
+          best_ask = 當前最優 ask，作為我嘅賣出底線（maker）
+          若 postOnly 成功 → maker fill，省 taker fee
+          若 postOnly 被 reject（bid 已高過 ask）→ IOC market @ best_bid
+        bid depth 唔夠                         → 直接 IOC market @ best_bid
     """
     # ── 最低下單量 guard ──────────────────────────────────────────────────
     if not _live_min_check(ex, symbol, state.size, state.notional):
         return
 
-    order_side = "buy" if state.position_side == "long" else "sell"
     try:
         amount_str = ex.amount_to_precision(symbol, state.size)
-        price_str  = ex.price_to_precision(symbol, state.entry_price)
     except Exception as e:
         logger.error("LIVE_ENTRY precision error %s: %s", symbol, e)
         return
 
-    # Hyperliquid market order 必須傳 price 作 slippage 參考（± 5% 保護）
-    use_market = False
-    for attempt in range(3):
+    # ── OB 參考價（用最新 OB，唔用 stale microprice）──────────────────────
+    best_bid = ob_bids[0][0] if ob_bids else state.entry_price
+    best_ask = ob_asks[0][0] if ob_asks else state.entry_price
+
+    def _market_ioc(order_side: str, ref_price: float, tag: str) -> bool:
+        """落 market order（HL 需要 price 作 slippage 參考）。返回 True = 成功。"""
         try:
-            if use_market:
-                order = ex.create_order(
-                    symbol, "market", order_side, float(amount_str),
-                    float(price_str),
-                    {"slippage": 0.05},
-                )
-            else:
-                order = ex.create_order(
-                    symbol, "limit", order_side,
-                    float(amount_str), float(price_str),
-                    {"postOnly": True},
-                )
+            px = ex.price_to_precision(symbol, ref_price)
+            order = ex.create_order(
+                symbol, "market", order_side, float(amount_str),
+                float(px), {"slippage": 0.05},
+            )
             logger.info(
-                "LIVE_ENTRY  %s %s  qty=%s  px=%s  type=%s  order_id=%s",
-                order_side.upper(), symbol,
-                amount_str, price_str,
-                "market" if use_market else "limit",
+                "LIVE_ENTRY  %s %s  qty=%s  px=%s  type=market(%s)  order_id=%s",
+                order_side.upper(), symbol, amount_str, px, tag,
+                order.get("id", "?"),
+            )
+            return True
+        except Exception as e:
+            logger.warning("LIVE_ENTRY market(%s) failed %s: %s", tag, symbol, e)
+            return False
+
+    # ── LONG：直接 IOC @ best_ask ─────────────────────────────────────────
+    if state.position_side == "long":
+        for attempt in range(3):
+            if _market_ioc("buy", best_ask, "IOC"):
+                return
+            if attempt < 2:
+                time.sleep(1)
+        logger.error("LIVE_ENTRY LONG all attempts failed %s", symbol)
+        return
+
+    # ── SHORT：睇 5 層 bid depth → postOnly @ best_ask；唔夠 → IOC ─────────
+    bid_depth_notional = sum(p * s for p, s in (ob_bids or [])[:5])
+    has_depth = bid_depth_notional >= state.notional   # 買方深度 ≥ 我們訂單
+
+    if has_depth and best_ask > 0:
+        try:
+            px = ex.price_to_precision(symbol, best_ask)
+            order = ex.create_order(
+                symbol, "limit", "sell", float(amount_str), float(px),
+                {"postOnly": True},
+            )
+            logger.info(
+                "LIVE_ENTRY  SELL %s  qty=%s  px=%s  type=postOnly(maker)  "
+                "bid_depth=%.2f  order_id=%s",
+                symbol, amount_str, px, bid_depth_notional,
                 order.get("id", "?"),
             )
             return
         except ccxt.InvalidOrder as e:
-            if not use_market:
-                logger.warning(
-                    "LIVE_ENTRY postOnly rejected %s (market crossed) → fallback market  [%s]",
-                    symbol, e,
-                )
-                use_market = True
-            else:
-                logger.error("LIVE_ENTRY market fallback also rejected %s: %s", symbol, e)
-                return
+            logger.info(
+                "LIVE_ENTRY postOnly rejected %s (market moved) → IOC  [%s]",
+                symbol, e,
+            )
         except Exception as e:
-            logger.warning("LIVE_ENTRY attempt %d failed %s: %s", attempt + 1, symbol, e)
-            if attempt < 2:
-                time.sleep(1)
+            logger.warning("LIVE_ENTRY postOnly error %s: %s", symbol, e)
+    else:
+        logger.info(
+            "LIVE_ENTRY SHORT %s bid_depth=%.2f < notional=%.2f → skip postOnly, IOC",
+            symbol, bid_depth_notional, state.notional,
+        )
 
-    logger.error("LIVE_ENTRY all attempts failed %s", symbol)
+    # postOnly 唔成功 / depth 唔夠 → IOC @ best_bid
+    for attempt in range(3):
+        if _market_ioc("sell", best_bid, "IOC"):
+            return
+        if attempt < 2:
+            time.sleep(1)
+    logger.error("LIVE_ENTRY SHORT all attempts failed %s", symbol)
 
 
 def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: ignore[no-untyped-def]
@@ -836,7 +878,7 @@ def main() -> None:
 
                 # ── 新開倉：bot 剛剛由無倉 → 有倉 ──────────────────────────
                 if not _was_in_pos and _st_after.in_position:
-                    _live_place_entry(ex, sym, _st_after)
+                    _live_place_entry(ex, sym, _st_after, ob_bids=bid_lvls, ob_asks=ask_lvls)
 
                 # ── 平倉：bot 返回 TradeRecord ──────────────────────────────
                 if rec is not None:
