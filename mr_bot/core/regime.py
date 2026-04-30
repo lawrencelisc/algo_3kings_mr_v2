@@ -49,12 +49,20 @@ class CoinEligibility:
     Opus 4.6 建議：
       只用 Hurst + half-life 做 hard filter，
       其他（ADF、spread CV）做 monitoring 但唔做 hard gate。
+
+    reason_code 係結構化標籤（供 funnel diagnostic 統計用）：
+      "data"  → 資料不足計 VR
+      "vr"    → VR 太高（trending / random walk）
+      "hl"    → HL 太長（mean reversion 比 timeout 仲慢）
+      "ok"    → 通過
+    reason 仍然係 human-readable 字串（log 用）。
     """
     symbol: str
     hurst: Optional[float]
     half_life_bars: Optional[float]
     eligible: bool
     reason: str
+    reason_code: str = ""
 
 
 def screen_coin(
@@ -90,7 +98,8 @@ def screen_coin(
     if vr is None:
         return CoinEligibility(
             symbol="", hurst=None, half_life_bars=None,
-            eligible=False, reason="insufficient_data_for_VR (need 22+ bars)"
+            eligible=False, reason="insufficient_data_for_VR (need 22+ bars)",
+            reason_code="data",
         )
 
     # 關 1：VR 太高（trending / random walk）
@@ -98,7 +107,8 @@ def screen_coin(
         return CoinEligibility(
             symbol="", hurst=h_equiv, half_life_bars=hl,
             eligible=False,
-            reason=f"VR={vr:.3f}>={vr_threshold:.2f} (trending/random walk)"
+            reason=f"VR={vr:.3f}>={vr_threshold:.2f} (trending/random walk)",
+            reason_code="vr",
         )
 
     # 關 2：HL 有值但太長（reversion 比 timeout 還慢，edge 幾乎零）
@@ -106,7 +116,8 @@ def screen_coin(
         return CoinEligibility(
             symbol="", hurst=h_equiv, half_life_bars=hl,
             eligible=False,
-            reason=f"HL={hl:.1f}bars > timeout×slack={timeout_bars * hl_slack:.1f}"
+            reason=f"HL={hl:.1f}bars > timeout×slack={timeout_bars * hl_slack:.1f}",
+            reason_code="hl",
         )
 
     # HL=None：VR 已確認 MR，AR(1) 估不到 HL 屬正常，放行但標記
@@ -114,7 +125,8 @@ def screen_coin(
     return CoinEligibility(
         symbol="", hurst=h_equiv, half_life_bars=hl,
         eligible=True,
-        reason=f"ok: VR={vr:.3f} (H≈{h_equiv:.3f}) {hl_note}"
+        reason=f"ok: VR={vr:.3f} (H≈{h_equiv:.3f}) {hl_note}",
+        reason_code="ok",
     )
 
 

@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Deque, Dict, List, Optional, Tuple
 
+import numpy as np
+
 from .core.indicators import (
     KalmanZScore,
     RollingHurst,
@@ -191,8 +193,9 @@ class BotConfig:
 
     # Gate funnel diagnostic：每 N 個 global bar（= sum of on_bar across symbols）
     # print 一次入場漏斗統計，方便睇邊道閘 reject 最多。
-    # 預設 200：例如 8 隻幣 × 25 bars/symbol ≈ 25 分鐘（poll=60s）一次。
-    gate_log_every_bars: int = 200
+    # 1000：46 幣 ×  ~22 polls/symbol ≈ 22 分鐘（poll=60s）一次，
+    # 足夠 sample 計 |z| 嘅 p95/p99 + 收集 screen 失敗 breakdown。
+    gate_log_every_bars: int = 1000
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -280,6 +283,17 @@ class MeanReversionBot:
         # Gate funnel counters（reset 每次 _log_gate_diag 之後）
         self._gate_stats: Dict[str, int] = {k: 0 for k in self._GATE_KEYS}
 
+        # |z| 分布 sample buffer（只 collect G3 通過嘅 bar，即真正有資格觸發 z 嘅）
+        # 用嚟 print max / p95 / p99 / mean，分辨：
+        #   p99 << z_entry  → z 結構性偏細（可能 Kalman R inflation），需修 scale
+        #   p99 >> z_entry  → z 偶然 cross threshold，純粹樣本不足，等多陣
+        self._z_abs_window: List[float] = []
+
+        # screen_coin 失敗原因 breakdown（每次 re-screen 累計一次）
+        # data：資料不足（warm-up 中）；vr：VR 太高（趨勢市）；
+        # hl：HL 太慢；ok：通過
+        self._screen_reasons: Dict[str, int] = {"data": 0, "vr": 0, "hl": 0, "ok": 0}
+
         logger.info(
             "MeanReversionBot initialized  equity=%.2f  "
             "fee: maker=%.4f%%  taker=%.4f%%  breakeven=%.2f bps",
@@ -366,6 +380,11 @@ class MeanReversionBot:
             state.hurst_val = result.hurst or state.hurst_val
             state.half_life_bars = result.half_life_bars
             state.eligibility_checked_at = state.bar_count
+
+            # 累計 screen 結果 breakdown（reason_code: data / vr / hl / ok）
+            rc = result.reason_code or "unknown"
+            self._screen_reasons[rc] = self._screen_reasons.get(rc, 0) + 1
+
             if not result.eligible:
                 logger.info("SCREEN  %s  INELIGIBLE  %s", symbol, result.reason)
 
@@ -393,6 +412,8 @@ class MeanReversionBot:
                     self._gate_stats["g2_eligible"] += 1
                     if regime_zone != RegimeZone.RED:
                         self._gate_stats["g3_regime"] += 1
+                        # Sample |z|：G3 通過 = 真正有資格觸發 z 嘅 bar
+                        self._z_abs_window.append(abs(float(z)))
                         self._try_entry(
                             state=state,
                             symbol=symbol,
@@ -713,9 +734,18 @@ class MeanReversionBot:
 
     def _log_gate_diag(self) -> None:
         """
-        Print 入場漏斗統計，然後 reset window。
+        Print 入場漏斗統計 + |z| 分布 + screen breakdown，然後 reset window。
+
         Funnel：bars → considered → G1 → G2 → G3 → G4 → G5 → G6 → G7 → G8 → opens
         每個 stage 嘅 % 係 conditional on 上一 stage 通過。
+
+        Diagnostic 解讀：
+          ZDIST  p99 << z_entry  → z 結構性偏細（Kalman R inflation 等），
+                                   降 threshold 都冇用，要修 Kalman scale
+          ZDIST  p99 >> z_entry  → z 偶然 cross threshold，純粹 sample 不足
+          SCREEN vr 佔大多數      → 趨勢市，universe 太多 trending 幣
+          SCREEN hl 佔大多數      → 反轉太慢，hl_slack 偏緊
+          SCREEN data 佔大多數    → warm-up 仲未夠，等多陣
         """
         s = self._gate_stats
 
@@ -740,7 +770,45 @@ class MeanReversionBot:
             s["opens"],
         )
 
+        # ── |z| 分布（G3 通過嘅 bar）────────────────────────────────────────
+        zw = self._z_abs_window
+        if zw:
+            arr = np.asarray(zw, dtype=float)
+            zmax = float(arr.max())
+            zmean = float(arr.mean())
+            p95 = float(np.percentile(arr, 95))
+            p99 = float(np.percentile(arr, 99))
+            n_ge_thresh = int((arr >= self.config.z_entry_short).sum())
+            logger.info(
+                "ZDIST  n=%d  mean|z|=%.2f  p95=%.2f  p99=%.2f  max=%.2f  "
+                "n(|z|>=%.2f)=%d (%.1f%%)",
+                len(arr), zmean, p95, p99, zmax,
+                self.config.z_entry_short, n_ge_thresh,
+                n_ge_thresh / len(arr) * 100,
+            )
+        else:
+            logger.info("ZDIST  n=0 (no G3-pass bars in this window)")
+
+        # ── screen_coin breakdown ──────────────────────────────────────────
+        sr = self._screen_reasons
+        total_screens = sum(sr.values())
+        if total_screens > 0:
+            logger.info(
+                "SCREEN_BREAKDOWN  total=%d  ok=%d (%s)  vr=%d (%s)  "
+                "hl=%d (%s)  data=%d (%s)",
+                total_screens,
+                sr.get("ok", 0), pct(sr.get("ok", 0), total_screens),
+                sr.get("vr", 0), pct(sr.get("vr", 0), total_screens),
+                sr.get("hl", 0), pct(sr.get("hl", 0), total_screens),
+                sr.get("data", 0), pct(sr.get("data", 0), total_screens),
+            )
+        else:
+            logger.info("SCREEN_BREAKDOWN  no re-screen events in this window")
+
+        # Reset window
         self._gate_stats = {k: 0 for k in self._GATE_KEYS}
+        self._z_abs_window = []
+        self._screen_reasons = {"data": 0, "vr": 0, "hl": 0, "ok": 0}
 
     def summary(self) -> dict:
         return self.account.summary()
