@@ -294,6 +294,11 @@ class MeanReversionBot:
         # hl：HL 太慢；ok：通過
         self._screen_reasons: Dict[str, int] = {"data": 0, "vr": 0, "hl": 0, "ok": 0}
 
+        # Warm-up flag：歷史 bar replay 期間 pause gate diagnostic
+        # （否則 46×600=27,600 個 replay bar 會 print 27 個無意義 GATE_DIAG，
+        # 而且 state.eligible 仲未設 → G2 永遠 0%，數字誤導）
+        self._in_warmup: bool = False
+
         logger.info(
             "MeanReversionBot initialized  equity=%.2f  "
             "fee: maker=%.4f%%  taker=%.4f%%  breakeven=%.2f bps",
@@ -402,18 +407,23 @@ class MeanReversionBot:
                 sell_flow=sell_flow,
             )
 
-        # 7. 入場（funnel 同時 count 每道閘）
-        self._gate_stats["bars"] += 1
+        # 7. 入場（funnel 同時 count 每道閘；warm-up 期間唔計）
+        if not self._in_warmup:
+            self._gate_stats["bars"] += 1
         if not state.in_position:
-            self._gate_stats["considered"] += 1
+            if not self._in_warmup:
+                self._gate_stats["considered"] += 1
             if z is not None:
-                self._gate_stats["g1_z"] += 1
+                if not self._in_warmup:
+                    self._gate_stats["g1_z"] += 1
                 if state.eligible:
-                    self._gate_stats["g2_eligible"] += 1
+                    if not self._in_warmup:
+                        self._gate_stats["g2_eligible"] += 1
                     if regime_zone != RegimeZone.RED:
-                        self._gate_stats["g3_regime"] += 1
-                        # Sample |z|：G3 通過 = 真正有資格觸發 z 嘅 bar
-                        self._z_abs_window.append(abs(float(z)))
+                        if not self._in_warmup:
+                            self._gate_stats["g3_regime"] += 1
+                            # Sample |z|：G3 通過 = 真正有資格觸發 z 嘅 bar
+                            self._z_abs_window.append(abs(float(z)))
                         self._try_entry(
                             state=state,
                             symbol=symbol,
@@ -429,12 +439,12 @@ class MeanReversionBot:
                             regime_zone=regime_zone,
                         )
 
-        # 8. Diag log
-        if self._global_bar % self.config.log_diag_every_bars == 0:
+        # 8. Diag log（warm-up 期間唔 print，避免被 replay 噪音淹沒）
+        if not self._in_warmup and self._global_bar % self.config.log_diag_every_bars == 0:
             self._log_diag(symbol, state, z, regime_zone, regime_reason, vpin_pct, vol_ratio)
 
-        # 8b. Gate funnel diag（reset window 之後再起跳）
-        if self._global_bar % self.config.gate_log_every_bars == 0:
+        # 8b. Gate funnel diag（warm-up 唔 print；reset window 之後再起跳）
+        if not self._in_warmup and self._global_bar % self.config.gate_log_every_bars == 0:
             self._log_gate_diag()
 
         return closed_rec
@@ -731,6 +741,35 @@ class MeanReversionBot:
     def gate_stats_snapshot(self) -> Dict[str, int]:
         """返回當前 gate funnel counter 嘅 copy（唔 reset）。"""
         return dict(self._gate_stats)
+
+    def start_warmup(self) -> None:
+        """
+        Warm-up 歷史 replay 開始前呼叫。
+        期間 _global_bar 仍會增加（Kalman/VPIN 等狀態正常 update），
+        但 gate funnel 唔 count、GATE_DIAG/DIAG 唔 print，
+        避免 replay bar 產生無意義 log。
+        Pair with end_warmup() afterwards.
+        """
+        self._in_warmup = True
+
+    def end_warmup(self) -> None:
+        """
+        Warm-up 完成後呼叫。只切返 live 模式，唔 reset 已累計嘅 live 統計。
+        Universe rescan 期間嘅 incremental warm-up 都用呢個（避免 reset live data）。
+        如果係 initial warm-up，外面跟住可以呼叫 reset_gate_diag()。
+        """
+        self._in_warmup = False
+
+    def reset_gate_diag(self) -> None:
+        """
+        手動 reset gate funnel + |z| buffer + screen breakdown。
+        典型用法：initial warm-up 完成後一次性 clean slate，
+        令 live 數字唔被任何前置事件污染。
+        """
+        self._gate_stats = {k: 0 for k in self._GATE_KEYS}
+        self._z_abs_window = []
+        self._screen_reasons = {"data": 0, "vr": 0, "hl": 0, "ok": 0}
+        logger.info("Gate diagnostic counters reset — fresh live window starting")
 
     def _log_gate_diag(self) -> None:
         """

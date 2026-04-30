@@ -512,6 +512,7 @@ def main() -> None:
 
     # ── Warm-up ─────────────────────────────────────────────────────────────
     logger.info("━━━ WARM-UP START — 歷史 bar replay，請稍候 ━━━")
+    bot.start_warmup()
     failed_syms: List[str] = []
     for sym in symbols:
         ok = warmup_symbol(bot, ex, sym, liq_trackers, prices_cache, ohlcv_cache, config)
@@ -523,6 +524,8 @@ def main() -> None:
             len(failed_syms), failed_syms,
         )
         symbols = [s for s in symbols if s not in failed_syms]
+    bot.end_warmup()
+    bot.reset_gate_diag()   # initial warm-up：clean slate 起跳
     logger.info("━━━ WARM-UP COMPLETE — %d symbols active, bot ready to trade ━━━", len(symbols))
 
     last_universe_scan_ts = time.time()
@@ -547,8 +550,10 @@ def main() -> None:
 
                 if added:
                     logger.info("Universe: adding %d new symbols: %s", len(added), added)
+                    bot.start_warmup()
                     added = [s for s in added
                              if warmup_symbol(bot, ex, s, liq_trackers, prices_cache, ohlcv_cache, config)]
+                    bot.end_warmup()
                     if added:
                         logger.info("Universe: %d symbols warmed-up successfully", len(added))
 
