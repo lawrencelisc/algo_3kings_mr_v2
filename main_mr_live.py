@@ -413,15 +413,133 @@ def warmup_symbol(
 # 設計原則：
 #   入場  → postOnly limit（maker fee 0.0384%）；若 market crossed 被 reject，
 #            fallback 到 market（taker 0.0400%，只差 0.16 bps，可接受）。
-#   出場  → 緊急出場（SL / REGIME_RED / ADVERSE_FLOW）用 market + reduceOnly；
+#            入場成功後立即落 bracket（TP limit + SL stop-market，均 reduceOnly）。
+#   出場  → 先 cancel bracket orders，再：
+#            緊急出場（SL / REGIME_RED / ADVERSE_FLOW）用 market + reduceOnly；
 #            正常出場（TP / DECEL / TIMEOUT）用 limit + reduceOnly + postOnly。
-#   Retry → 最多 3 次，間隔 1s；三次都失敗 → ERROR log，但唔 crash bot。
+#   Bracket → 若 SL 或 TP bracket 落單失敗，只 WARNING log；bot 內部邏輯仍係後備。
+#   Retry  → 最多 3 次，間隔 1s；三次都失敗 → ERROR log，但唔 crash bot。
 #
-# 為何唔預先 cancel stale orders：
-#   bot 每 bar 最多開一個倉，且 on_bar 返回 rec 代表已完全平倉，
-#   下一個入場訊號一定係新 bar，唔會有 stale。
+# _live_orders: {symbol: {"tp": order_id | None, "sl": order_id | None}}
+#   追蹤每個 symbol 現有嘅 bracket orders，出場時用嚟 cancel。
 #
 _TAKER_REASONS = frozenset({"SL", "REGIME_RED", "ADVERSE_FLOW"})
+_live_orders: Dict[str, Dict[str, Optional[str]]] = {}
+
+
+def _live_wait_fill(
+    ex: ccxt.Exchange,
+    symbol: str,
+    order_id: str,
+    timeout_secs: float = 10.0,
+    poll_interval: float = 0.5,
+) -> bool:
+    """
+    Poll fetch_order 直到 order 成交（closed/filled）或超時。
+    用於 postOnly resting orders：必須等到 position 真實存在，
+    才能落 reduceOnly bracket orders。
+    返回 True = 已成交；False = 超時或取消。
+    """
+    elapsed = 0.0
+    while elapsed < timeout_secs:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            o = ex.fetch_order(order_id, symbol)
+            status = o.get("status", "")
+            if status in ("closed", "filled"):
+                return True
+            if status in ("canceled", "cancelled", "rejected", "expired"):
+                logger.info(
+                    "LIVE_WAIT_FILL %s order_id=%s status=%s → skip bracket",
+                    symbol, order_id, status,
+                )
+                return False
+        except Exception as e:
+            logger.debug("LIVE_WAIT_FILL fetch error %s: %s", symbol, e)
+    logger.warning(
+        "LIVE_WAIT_FILL %s order_id=%s timeout after %.0fs → skip bracket (internal SL/TP active)",
+        symbol, order_id, timeout_secs,
+    )
+    return False
+
+
+def _live_place_bracket(
+    ex: ccxt.Exchange,
+    symbol: str,
+    state,  # type: ignore[no-untyped-def]
+) -> None:
+    """
+    Entry order 確認成交、position 已存在後，落 bracket orders（均 reduceOnly）。
+
+    TP  → limit + postOnly @ state.tp_price  (爭取 maker fill)
+    SL  → stop_market，triggerPrice @ state.sl_price  (止蝕保護，taker 可接受)
+
+    呼叫前必須確保 position 已在交易所存在，否則 reduceOnly 會被 reject。
+    若 SL 或 TP 任何一個失敗，只 WARNING — bot 內部 3min bar SL/TP 仍係後備。
+    Order IDs 寫入 _live_orders[symbol] 供 _live_cancel_bracket 用。
+    """
+    exit_side = "sell" if state.position_side == "long" else "buy"
+    orders: Dict[str, Optional[str]] = {"tp": None, "sl": None}
+
+    try:
+        amount_str = ex.amount_to_precision(symbol, state.size)
+    except Exception as e:
+        logger.warning("LIVE_BRACKET precision error %s: %s", symbol, e)
+        return
+
+    # ── TP：limit + postOnly + reduceOnly @ tp_price ──────────────────────
+    try:
+        tp_px = ex.price_to_precision(symbol, state.tp_price)
+        tp_order = ex.create_order(
+            symbol, "limit", exit_side, float(amount_str), float(tp_px),
+            {"reduceOnly": True, "postOnly": True},
+        )
+        orders["tp"] = tp_order.get("id")
+        logger.info(
+            "LIVE_TP  %s %s  qty=%s  px=%s  order_id=%s",
+            exit_side.upper(), symbol, amount_str, tp_px, orders["tp"],
+        )
+    except Exception as e:
+        logger.warning("LIVE_TP failed %s: %s (internal TP still active)", symbol, e)
+
+    # ── SL：stop_market + reduceOnly，trigger @ sl_price ──────────────────
+    try:
+        sl_px = ex.price_to_precision(symbol, state.sl_price)
+        sl_order = ex.create_order(
+            symbol, "stop_market", exit_side, float(amount_str), float(sl_px),
+            {"reduceOnly": True, "triggerPrice": float(sl_px), "slippage": 0.05},
+        )
+        orders["sl"] = sl_order.get("id")
+        logger.info(
+            "LIVE_SL  %s %s  qty=%s  trigger=%s  order_id=%s",
+            exit_side.upper(), symbol, amount_str, sl_px, orders["sl"],
+        )
+    except Exception as e:
+        logger.warning("LIVE_SL failed %s: %s (internal SL still active)", symbol, e)
+
+    _live_orders[symbol] = orders
+
+
+def _live_cancel_bracket(ex: ccxt.Exchange, symbol: str) -> None:
+    """
+    出場前 cancel 該 symbol 嘅 bracket orders（TP + SL）。
+    若 order 已經成交或唔存在，catch exception 並 debug log（唔 crash）。
+    """
+    orders = _live_orders.pop(symbol, {})
+    for order_type, oid in orders.items():
+        if oid:
+            try:
+                ex.cancel_order(oid, symbol)
+                logger.info(
+                    "LIVE_CANCEL_%s  %s  order_id=%s",
+                    order_type.upper(), symbol, oid,
+                )
+            except Exception as e:
+                logger.debug(
+                    "LIVE_CANCEL_%s %s order_id=%s: %s (may already be filled/cancelled)",
+                    order_type.upper(), symbol, oid, e,
+                )
 
 
 def _live_min_check(ex: ccxt.Exchange, symbol: str, size: float, notional: float) -> bool:
@@ -489,7 +607,11 @@ def _live_place_entry(
     best_ask = ob_asks[0][0] if ob_asks else state.entry_price
 
     def _market_ioc(order_side: str, ref_price: float, tag: str) -> bool:
-        """落 market order（HL 需要 price 作 slippage 參考）。返回 True = 成功。"""
+        """
+        落 market/IOC order（HL 需要 price 作 slippage 參考）。
+        返回 True = 成功。市價單在 create_order 返回時已成交，
+        sleep 1s 讓 position 在交易所完全同步後，再落 bracket。
+        """
         try:
             px = ex.price_to_precision(symbol, ref_price)
             order = ex.create_order(
@@ -501,6 +623,9 @@ def _live_place_entry(
                 order_side.upper(), symbol, amount_str, px, tag,
                 order.get("id", "?"),
             )
+            # Position propagation delay：market order 雖然即時成交，
+            # 但交易所 position state 需要約 1s 同步，才能接受 reduceOnly orders。
+            time.sleep(1)
             return True
         except Exception as e:
             logger.warning("LIVE_ENTRY market(%s) failed %s: %s", tag, symbol, e)
@@ -510,6 +635,7 @@ def _live_place_entry(
     if state.position_side == "long":
         for attempt in range(3):
             if _market_ioc("buy", best_ask, "IOC"):
+                _live_place_bracket(ex, symbol, state)
                 return
             if attempt < 2:
                 time.sleep(1)
@@ -527,12 +653,21 @@ def _live_place_entry(
                 symbol, "limit", "sell", float(amount_str), float(px),
                 {"postOnly": True},
             )
+            oid = order.get("id")
             logger.info(
                 "LIVE_ENTRY  SELL %s  qty=%s  px=%s  type=postOnly(maker)  "
                 "bid_depth=%.2f  order_id=%s",
-                symbol, amount_str, px, bid_depth_notional,
-                order.get("id", "?"),
+                symbol, amount_str, px, bid_depth_notional, oid,
             )
+            # postOnly resting：必須等訂單真實成交，position 存在後才落 bracket。
+            # poll fetch_order（最多 10s），成交後立即落 bracket。
+            if oid and _live_wait_fill(ex, symbol, oid):
+                _live_place_bracket(ex, symbol, state)
+            else:
+                logger.warning(
+                    "LIVE_ENTRY SHORT %s postOnly not filled → bracket skipped "
+                    "(internal SL/TP active)", symbol,
+                )
             return
         except ccxt.InvalidOrder as e:
             logger.info(
@@ -550,6 +685,7 @@ def _live_place_entry(
     # postOnly 唔成功 / depth 唔夠 → IOC @ best_bid
     for attempt in range(3):
         if _market_ioc("sell", best_bid, "IOC"):
+            _live_place_bracket(ex, symbol, state)
             return
         if attempt < 2:
             time.sleep(1)
@@ -564,6 +700,9 @@ def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: igno
     rec.size        = 合約數量
     rec.exit_price  = bot 嘅出場估算價（limit 出場用）
     """
+    # 先 cancel bracket（TP + SL）；若已成交或不存在，debug log 不 crash。
+    _live_cancel_bracket(ex, symbol)
+
     exit_side  = "sell" if rec.side == "long" else "buy"
     use_market = rec.reason in _TAKER_REASONS
 
