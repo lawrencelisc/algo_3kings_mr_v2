@@ -737,6 +737,17 @@ def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: igno
             )
             return
         except ccxt.InvalidOrder as e:
+            err_str = str(e)
+            # "Reduce only order would increase position" = 倉位已不存在
+            # （bracket TP/SL 比 bot 快一步平了倉，或之前入場失敗的 ghost position）
+            # 此為預期情況，無需重試，靜默記錄即可。
+            if "would increase position" in err_str or "increase position" in err_str:
+                logger.info(
+                    "LIVE_EXIT  %s  reason=%s → position already closed "
+                    "(bracket TP/SL filled first or ghost position); no action needed.",
+                    symbol, rec.reason,
+                )
+                return
             if not use_market:
                 logger.warning(
                     "LIVE_EXIT postOnly rejected %s reason=%s → fallback market  [%s]",
