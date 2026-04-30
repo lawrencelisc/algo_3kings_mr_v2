@@ -424,13 +424,46 @@ def warmup_symbol(
 _TAKER_REASONS = frozenset({"SL", "REGIME_RED", "ADVERSE_FLOW"})
 
 
+def _live_min_check(ex: ccxt.Exchange, symbol: str, size: float, notional: float) -> bool:
+    """
+    Check Hyperliquid minimum order requirements。
+    返回 True = 可以下單；False = 低於最低限制，應 skip。
+    用 ex.market() 取交易所實際 limits，唔 hardcode。
+    """
+    try:
+        mkt    = ex.market(symbol)
+        limits = mkt.get("limits", {})
+        min_amt  = (limits.get("amount") or {}).get("min") or 0.0
+        min_cost = (limits.get("cost")   or {}).get("min") or 0.0
+        if min_amt  and size     < min_amt:
+            logger.warning(
+                "LIVE_SKIP_MIN_SIZE  %s  size=%.6f < exchange_min=%.6f",
+                symbol, size, min_amt,
+            )
+            return False
+        if min_cost and notional < min_cost:
+            logger.warning(
+                "LIVE_SKIP_MIN_NOTIONAL  %s  notional=%.4f < exchange_min=%.4f",
+                symbol, notional, min_cost,
+            )
+            return False
+    except Exception as e:
+        logger.debug("LIVE_MIN_CHECK skip (market info unavailable) %s: %s", symbol, e)
+    return True
+
+
 def _live_place_entry(ex: ccxt.Exchange, symbol: str, state) -> None:  # type: ignore[no-untyped-def]
     """
     Bot 剛剛虛擬開倉，mirror 到真實交易所。
     state.position_side = "long" | "short"
     state.entry_price   = 目標掛單價（bot 嘅 microprice fill 估算）
     state.size          = 合約數量（base asset unit）
+    state.notional      = 名義金額（USDT）
     """
+    # ── 最低下單量 guard ──────────────────────────────────────────────────
+    if not _live_min_check(ex, symbol, state.size, state.notional):
+        return
+
     order_side = "buy" if state.position_side == "long" else "sell"
     try:
         amount_str = ex.amount_to_precision(symbol, state.size)
@@ -440,12 +473,10 @@ def _live_place_entry(ex: ccxt.Exchange, symbol: str, state) -> None:  # type: i
         return
 
     # Hyperliquid market order 必須傳 price 作 slippage 參考（± 5% 保護）
-    # postOnly limit 唔需要 price 以外任何參數
     use_market = False
     for attempt in range(3):
         try:
             if use_market:
-                # price = 入場參考價；HL 用佢計 max_slippage_price（± slippage%）
                 order = ex.create_order(
                     symbol, "market", order_side, float(amount_str),
                     float(price_str),
@@ -465,15 +496,15 @@ def _live_place_entry(ex: ccxt.Exchange, symbol: str, state) -> None:  # type: i
                 order.get("id", "?"),
             )
             return
-        except ccxt.InvalidOrder:
+        except ccxt.InvalidOrder as e:
             if not use_market:
                 logger.warning(
-                    "LIVE_ENTRY postOnly rejected %s (market crossed) → fallback market",
-                    symbol,
+                    "LIVE_ENTRY postOnly rejected %s (market crossed) → fallback market  [%s]",
+                    symbol, e,
                 )
                 use_market = True
             else:
-                logger.error("LIVE_ENTRY market fallback also rejected %s", symbol)
+                logger.error("LIVE_ENTRY market fallback also rejected %s: %s", symbol, e)
                 return
         except Exception as e:
             logger.warning("LIVE_ENTRY attempt %d failed %s: %s", attempt + 1, symbol, e)
@@ -524,15 +555,15 @@ def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: igno
                 order.get("id", "?"),
             )
             return
-        except ccxt.InvalidOrder:
+        except ccxt.InvalidOrder as e:
             if not use_market:
                 logger.warning(
-                    "LIVE_EXIT postOnly rejected %s reason=%s → fallback market",
-                    symbol, rec.reason,
+                    "LIVE_EXIT postOnly rejected %s reason=%s → fallback market  [%s]",
+                    symbol, rec.reason, e,
                 )
                 use_market = True
             else:
-                logger.error("LIVE_EXIT market fallback rejected %s", symbol)
+                logger.error("LIVE_EXIT market fallback rejected %s: %s", symbol, e)
                 return
         except Exception as e:
             logger.warning("LIVE_EXIT attempt %d failed %s: %s", attempt + 1, symbol, e)
