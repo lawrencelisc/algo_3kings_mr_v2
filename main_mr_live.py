@@ -408,6 +408,133 @@ def warmup_symbol(
     return True
 
 
+# ── Live Order Helpers ───────────────────────────────────────────────────────
+#
+# 設計原則：
+#   入場  → postOnly limit（maker fee 0.0384%）；若 market crossed 被 reject，
+#            fallback 到 market（taker 0.0400%，只差 0.16 bps，可接受）。
+#   出場  → 緊急出場（SL / REGIME_RED / ADVERSE_FLOW）用 market + reduceOnly；
+#            正常出場（TP / DECEL / TIMEOUT）用 limit + reduceOnly + postOnly。
+#   Retry → 最多 3 次，間隔 1s；三次都失敗 → ERROR log，但唔 crash bot。
+#
+# 為何唔預先 cancel stale orders：
+#   bot 每 bar 最多開一個倉，且 on_bar 返回 rec 代表已完全平倉，
+#   下一個入場訊號一定係新 bar，唔會有 stale。
+#
+_TAKER_REASONS = frozenset({"SL", "REGIME_RED", "ADVERSE_FLOW"})
+
+
+def _live_place_entry(ex: ccxt.Exchange, symbol: str, state) -> None:  # type: ignore[no-untyped-def]
+    """
+    Bot 剛剛虛擬開倉，mirror 到真實交易所。
+    state.position_side = "long" | "short"
+    state.entry_price   = 目標掛單價（bot 嘅 microprice fill 估算）
+    state.size          = 合約數量（base asset unit）
+    """
+    order_side = "buy" if state.position_side == "long" else "sell"
+    try:
+        amount_str = ex.amount_to_precision(symbol, state.size)
+        price_str  = ex.price_to_precision(symbol, state.entry_price)
+    except Exception as e:
+        logger.error("LIVE_ENTRY precision error %s: %s", symbol, e)
+        return
+
+    use_market = False
+    for attempt in range(3):
+        try:
+            if use_market:
+                order = ex.create_order(
+                    symbol, "market", order_side, float(amount_str),
+                )
+            else:
+                order = ex.create_order(
+                    symbol, "limit", order_side,
+                    float(amount_str), float(price_str),
+                    {"postOnly": True},
+                )
+            logger.info(
+                "LIVE_ENTRY  %s %s  qty=%s  px=%s  type=%s  order_id=%s",
+                order_side.upper(), symbol,
+                amount_str, price_str if not use_market else "MKT",
+                "market" if use_market else "limit",
+                order.get("id", "?"),
+            )
+            return
+        except ccxt.InvalidOrder:
+            if not use_market:
+                logger.warning(
+                    "LIVE_ENTRY postOnly rejected %s (market crossed) → fallback market",
+                    symbol,
+                )
+                use_market = True
+            else:
+                logger.error("LIVE_ENTRY market fallback also rejected %s", symbol)
+                return
+        except Exception as e:
+            logger.warning("LIVE_ENTRY attempt %d failed %s: %s", attempt + 1, symbol, e)
+            if attempt < 2:
+                time.sleep(1)
+
+    logger.error("LIVE_ENTRY all attempts failed %s", symbol)
+
+
+def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: ignore[no-untyped-def]
+    """
+    Bot 剛剛虛擬平倉，mirror 到真實交易所。
+    rec.side        = 持倉方向（"long"|"short"），exit 係反方向
+    rec.reason      = 出場原因（決定 taker vs maker）
+    rec.size        = 合約數量
+    rec.exit_price  = bot 嘅出場估算價（limit 出場用）
+    """
+    exit_side  = "sell" if rec.side == "long" else "buy"
+    use_market = rec.reason in _TAKER_REASONS
+
+    try:
+        amount_str = ex.amount_to_precision(symbol, rec.size)
+        price_str  = ex.price_to_precision(symbol, rec.exit_price)
+    except Exception as e:
+        logger.error("LIVE_EXIT precision error %s: %s", symbol, e)
+        return
+
+    for attempt in range(3):
+        try:
+            if use_market:
+                order = ex.create_order(
+                    symbol, "market", exit_side, float(amount_str),
+                    None, {"reduceOnly": True},
+                )
+            else:
+                order = ex.create_order(
+                    symbol, "limit", exit_side,
+                    float(amount_str), float(price_str),
+                    {"reduceOnly": True, "postOnly": True},
+                )
+            logger.info(
+                "LIVE_EXIT  %s %s  reason=%s  qty=%s  px=%s  type=%s  order_id=%s",
+                exit_side.upper(), symbol, rec.reason,
+                amount_str, price_str if not use_market else "MKT",
+                "market" if use_market else "limit",
+                order.get("id", "?"),
+            )
+            return
+        except ccxt.InvalidOrder:
+            if not use_market:
+                logger.warning(
+                    "LIVE_EXIT postOnly rejected %s reason=%s → fallback market",
+                    symbol, rec.reason,
+                )
+                use_market = True
+            else:
+                logger.error("LIVE_EXIT market fallback rejected %s", symbol)
+                return
+        except Exception as e:
+            logger.warning("LIVE_EXIT attempt %d failed %s: %s", attempt + 1, symbol, e)
+            if attempt < 2:
+                time.sleep(1)
+
+    logger.error("LIVE_EXIT all attempts failed %s reason=%s", symbol, rec.reason)
+
+
 # ── fetch_one helper ──────────────────────────────────────────────────────────
 # Main loop 只需最新幾根 bar 計 ATR + 最新 close/volume。
 # 歷史 600 bars 已喺 warm-up 階段拉咗，主循環唔需要重複拉。
@@ -630,6 +757,10 @@ def main() -> None:
             buy_flow  = volume * 0.5 * (1 + (1 if price_chg > 0 else -1) * 0.3)
             sell_flow = volume - buy_flow
 
+            # Snapshot 入場前持倉狀態，用嚟偵測新開倉
+            _st_before = bot.get_state(sym)
+            _was_in_pos = _st_before.in_position
+
             rec = bot.on_bar(
                 symbol=sym,
                 close=close, high=high, low=low, volume=volume,
@@ -641,8 +772,16 @@ def main() -> None:
                 prices_for_screen=prices_cache[sym] if len(prices_cache[sym]) >= 200 else None,
             )
 
-            if rec is None and not paper:
-                pass  # Live 下單 callback（按需實現）
+            if not paper:
+                _st_after = bot.get_state(sym)
+
+                # ── 新開倉：bot 剛剛由無倉 → 有倉 ──────────────────────────
+                if not _was_in_pos and _st_after.in_position:
+                    _live_place_entry(ex, sym, _st_after)
+
+                # ── 平倉：bot 返回 TradeRecord ──────────────────────────────
+                if rec is not None:
+                    _live_place_exit(ex, sym, rec)
 
         # ── Summary（每 10 分鐘）────────────────────────────────────────────
         if int(loop_start) % 600 < int(poll_sec):
