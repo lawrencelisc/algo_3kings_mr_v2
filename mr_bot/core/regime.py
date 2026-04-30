@@ -64,19 +64,18 @@ def screen_coin(
     hl_slack: float = 1.5,
 ) -> CoinEligibility:
     """
-    兩關篩選（ROUND2：改用 Variance Ratio 取代 R/S Hurst）：
+    篩選邏輯（VR 為主關，HL 為輔助限制）：
 
-      1. VR(5) < vr_threshold
-         vr_threshold = hurst_threshold × 2（0.45 → 0.90）
-         VR < 0.90 代表 mean reversion 夠強
+      關 1（硬關）：VR(5) < vr_threshold（0.90）
+        VR 用 log-return（stationary），對 crypto 準確。
+        VR < 0.90 = 有足夠 mean-reversion tendency。
 
-      2. half_life < timeout_bars × hl_slack
-
-    改用 VR 的原因：
-      R/S Hurst 假設 price series stationary，
-      crypto price 係 non-stationary（unit root），
-      結果永遠 H≈1.0，所有幣都 eligible=False。
-      VR 用 log-return（stationary），對 crypto 天然 robust。
+      關 2（軟關）：half_life_ou
+        HL=None 時唔直接 block：
+          OU AR(1) 在 non-stationary price 上 β≥0 很常見（即使 VR 顯示 MR），
+          屬於估計誤差，唔代表冇 mean-reversion。
+          → 視作「HL 未知，保守地用 timeout_bars 作上限」，仍然 eligible。
+        HL 有值時：只 block HL > timeout × hl_slack（太慢 revert）。
     """
     arr = list(prices)
 
@@ -87,12 +86,14 @@ def screen_coin(
     # 映射 VR 到 hurst-like 值（供 DIAG log 顯示）
     h_equiv = (vr * 0.5) if vr is not None else None
 
+    # 關 1：資料不足
     if vr is None:
         return CoinEligibility(
             symbol="", hurst=None, half_life_bars=None,
             eligible=False, reason="insufficient_data_for_VR (need 22+ bars)"
         )
 
+    # 關 1：VR 太高（trending / random walk）
     if vr >= vr_threshold:
         return CoinEligibility(
             symbol="", hurst=h_equiv, half_life_bars=hl,
@@ -100,23 +101,20 @@ def screen_coin(
             reason=f"VR={vr:.3f}>={vr_threshold:.2f} (trending/random walk)"
         )
 
-    if hl is None:
-        return CoinEligibility(
-            symbol="", hurst=h_equiv, half_life_bars=None,
-            eligible=False, reason="half_life: β>=0 (trending) or insufficient data"
-        )
-
-    if hl > timeout_bars * hl_slack:
+    # 關 2：HL 有值但太長（reversion 比 timeout 還慢，edge 幾乎零）
+    if hl is not None and hl > timeout_bars * hl_slack:
         return CoinEligibility(
             symbol="", hurst=h_equiv, half_life_bars=hl,
             eligible=False,
             reason=f"HL={hl:.1f}bars > timeout×slack={timeout_bars * hl_slack:.1f}"
         )
 
+    # HL=None：VR 已確認 MR，AR(1) 估不到 HL 屬正常，放行但標記
+    hl_note = f"HL={hl:.1f}bars" if hl is not None else "HL=unknown(VR-pass)"
     return CoinEligibility(
         symbol="", hurst=h_equiv, half_life_bars=hl,
         eligible=True,
-        reason=f"ok: VR={vr:.3f} (H≈{h_equiv:.3f}) HL={hl:.1f}bars"
+        reason=f"ok: VR={vr:.3f} (H≈{h_equiv:.3f}) {hl_note}"
     )
 
 
