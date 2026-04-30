@@ -439,12 +439,17 @@ def _live_place_entry(ex: ccxt.Exchange, symbol: str, state) -> None:  # type: i
         logger.error("LIVE_ENTRY precision error %s: %s", symbol, e)
         return
 
+    # Hyperliquid market order 必須傳 price 作 slippage 參考（± 5% 保護）
+    # postOnly limit 唔需要 price 以外任何參數
     use_market = False
     for attempt in range(3):
         try:
             if use_market:
+                # price = 入場參考價；HL 用佢計 max_slippage_price（± slippage%）
                 order = ex.create_order(
                     symbol, "market", order_side, float(amount_str),
+                    float(price_str),
+                    {"slippage": 0.05},
                 )
             else:
                 order = ex.create_order(
@@ -455,7 +460,7 @@ def _live_place_entry(ex: ccxt.Exchange, symbol: str, state) -> None:  # type: i
             logger.info(
                 "LIVE_ENTRY  %s %s  qty=%s  px=%s  type=%s  order_id=%s",
                 order_side.upper(), symbol,
-                amount_str, price_str if not use_market else "MKT",
+                amount_str, price_str,
                 "market" if use_market else "limit",
                 order.get("id", "?"),
             )
@@ -499,9 +504,11 @@ def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: igno
     for attempt in range(3):
         try:
             if use_market:
+                # Hyperliquid market order 必須傳 price 作 slippage 參考
                 order = ex.create_order(
                     symbol, "market", exit_side, float(amount_str),
-                    None, {"reduceOnly": True},
+                    float(price_str),
+                    {"reduceOnly": True, "slippage": 0.05},
                 )
             else:
                 order = ex.create_order(
@@ -512,7 +519,7 @@ def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: igno
             logger.info(
                 "LIVE_EXIT  %s %s  reason=%s  qty=%s  px=%s  type=%s  order_id=%s",
                 exit_side.upper(), symbol, rec.reason,
-                amount_str, price_str if not use_market else "MKT",
+                amount_str, price_str,
                 "market" if use_market else "limit",
                 order.get("id", "?"),
             )
