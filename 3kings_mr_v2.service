@@ -7,7 +7,7 @@ Type=simple
 Environment=SSL_CERT_FILE=/usr/local/app/algo_3kings_mr_v2/venv/lib/python3.12/site-packages/certifi/cacert.pem
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/usr/local/app/algo_3kings_mr_v2
-ExecStart=/usr/local/app/algo_3kings_mr_v2/venv/bin/python3.12 -u live_trading.py
+ExecStart=/usr/local/app/algo_3kings_mr_v2/venv/bin/python3.12 -u main_mr_live.py
 Restart=always
 RestartSec=10
 User=root
