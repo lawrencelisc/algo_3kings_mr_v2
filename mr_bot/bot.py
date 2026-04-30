@@ -102,6 +102,9 @@ class SymbolState:
     size_mult: float = 1.0
     bar_count: int = 0
 
+    # SL 冷卻期（防止接刀：SL 出場後同一幣唔可以即刻重入）
+    sl_cooldown_until_bar: int = 0   # bar_count 超過此值才可再入場
+
     # Rolling P&L statistics（for Kelly sizing）
     _pnl_history: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
 
@@ -149,8 +152,17 @@ class BotConfig:
     # Timeout（分 bar 計）
     timeout_bars: int = 30
 
+    # SL 冷卻期：止損後同一幣種至少等幾多 bars 才可再入場（防接刀）
+    sl_cooldown_bars: int = 3       # default 3 bars（3m bar = 9 分鐘冷靜期）
+
     # SL config
     atr_mult: float = 1.0
+    # SL bps 上下限（自適應跨幣種，唔需要 WFA）：
+    #   sl_bps = clamp(atr_mult × ATR / price × 1e4, min_sl_bps, max_sl_bps)
+    #   BTC: raw≈12bps → floor to 15bps；SOL: raw≈40bps → 直接用；
+    #   超波動幣: cap at 80bps 防止 SL 太大虧大錢
+    min_sl_bps: float = 15.0   # 最窄 SL = 15 bps（> breakeven 7.84 bps）
+    max_sl_bps: float = 80.0   # 最闊 SL = 80 bps（細幣保護上限）
     sl_config: DynamicSLConfig = field(default_factory=DynamicSLConfig)
 
     # Sizing
@@ -398,6 +410,14 @@ class MeanReversionBot:
         if side is None:
             return
 
+        # SL 冷卻期：止損後唔可以即刻重入（防接刀 / 連輸）
+        if state.bar_count < state.sl_cooldown_until_bar:
+            logger.debug(
+                "SL_COOLDOWN  %s  bars_left=%d",
+                symbol, state.sl_cooldown_until_bar - state.bar_count,
+            )
+            return
+
         # Correlation cap：防止隱性集中風險
         held_symbols = [s for s, st in self._states.items() if st.in_position]
         corr_blocked, corr_reason = self.corr_guard.check_entry(symbol, held_symbols)
@@ -415,10 +435,18 @@ class MeanReversionBot:
         if fill_price is None:
             return
 
-        # Base SL distance（ATR-normalized）
-        base_sl = self.config.atr_mult * atr
+        # Base SL distance（bps-clamped ATR，自適應跨幣種）
+        # raw_sl_bps = atr_mult × ATR / price × 1e4
+        # clamp 到 [min_sl_bps, max_sl_bps]，防止大幣太緊、細幣太闊
+        raw_sl_bps = self.config.atr_mult * atr / max(fill_price, 1e-9) * 1e4
+        sl_bps = max(self.config.min_sl_bps, min(raw_sl_bps, self.config.max_sl_bps))
+        base_sl = sl_bps / 1e4 * fill_price
         if base_sl <= 0:
             return
+        logger.debug(
+            "SL  %s  raw=%.1f bps → clamped=%.1f bps  dist=%.4f",
+            symbol, raw_sl_bps, sl_bps, base_sl,
+        )
 
         # TP price（Kalman fair value，即 mean reversion target）
         tp_price = state.kalman.fair_value or mp
@@ -579,6 +607,15 @@ class MeanReversionBot:
 
         # 更新 per-symbol P&L history（for Kelly sizing）
         state.update_pnl_history(rec.net_pnl)
+
+        # SL 出場：設定冷卻期，防止接刀連輸
+        if reason in ("SL", "REGIME_RED", "ADVERSE_FLOW"):
+            state.sl_cooldown_until_bar = state.bar_count + self.config.sl_cooldown_bars
+            logger.info(
+                "SL_COOLDOWN set  %s  no re-entry for %d bars (~%d min)",
+                symbol, self.config.sl_cooldown_bars,
+                int(self.config.sl_cooldown_bars * self.config.bar_duration_sec / 60),
+            )
 
         # 清倉 state
         state.in_position = False
