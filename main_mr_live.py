@@ -609,6 +609,16 @@ def main() -> None:
     atr_mult     = float(os.environ.get("MR_ATR_MULT", "1.0"))
     equity       = float(os.environ.get("MR_EQUITY_USDT", "1000"))
 
+    # Position sizing fractions（% of equity per trade）
+    # Hyperliquid 最低 notional = $10。
+    # 公式：min_fraction × equity ≥ 10  →  min_fraction ≥ 10 / equity
+    # 例：equity=$150  → min_fraction ≥ 6.67%，建議設 0.07（7%）
+    # 例：equity=$500  → min_fraction ≥ 2.0%，可設 0.025
+    # 例：equity=$2000 → min_fraction ≥ 0.5%，用預設 0.005
+    # max_fraction 建議 = min_fraction × 3～5（允許 Kelly 放大）
+    min_fraction = float(os.environ.get("MR_MIN_FRACTION", "0.005"))
+    max_fraction = float(os.environ.get("MR_MAX_FRACTION", "0.05"))
+
     # Universe scan params
     universe_scan    = os.environ.get("MR_UNIVERSE_SCAN", "0").strip() == "1"
     universe_top_k   = int(os.environ.get("MR_UNIVERSE_TOP_K", "8"))
@@ -624,6 +634,7 @@ def main() -> None:
     # re-screen 用 BotConfig.hurst_threshold=0.45 → VR<0.90 strict，導致
     # universe relaxed 揀返嚟嘅幣即時被打成 eligible=False，永遠唔開倉。
     # 直接將 relax 值傳落 BotConfig，兩邊用同一道閘。
+    from mr_bot.core.regime import SizingConfig as _SizingConfig
     config = BotConfig(
         initial_equity=equity,
         z_entry_long=-z_entry,
@@ -633,10 +644,20 @@ def main() -> None:
         bar_duration_sec=poll_sec,
         csv_path=csv_path,
         hurst_threshold=universe_relax_hurst,
+        sizing_config=_SizingConfig(
+            min_fraction=min_fraction,
+            max_fraction=max_fraction,
+        ),
     )
     logger.info(
         "VR threshold aligned: screen_coin uses VR<%.2f (from MR_UNIVERSE_RELAX_HURST=%.2f)",
         universe_relax_hurst * 2.0, universe_relax_hurst,
+    )
+    logger.info(
+        "Sizing: equity=%.2f  min_frac=%.1f%%  max_frac=%.1f%%  "
+        "→ min_notional=%.2f  max_notional=%.2f  (HL exchange_min=10 USDT)",
+        equity, min_fraction * 100, max_fraction * 100,
+        equity * min_fraction, equity * max_fraction,
     )
     bot = MeanReversionBot(config)
     ex  = _make_exchange()
