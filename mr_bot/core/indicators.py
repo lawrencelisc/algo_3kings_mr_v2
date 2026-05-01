@@ -330,7 +330,10 @@ class VPIN:
         # Bulk Volume Classification：用 return sign 估 buy fraction
         ret = close - self._prev_close
         sigma_ret = 1e-6  # 防止 div/0，後面會動態更新
-        if self._history:
+        if len(self._history) >= 2:
+            # np.diff(arr) 需要 >= 2 個元素才返回非空 array；
+            # 若 _history 只有 1 個元素，np.diff → []，np.std([]) 會發出
+            # "Degrees of freedom <= 0" RuntimeWarning。
             arr = np.array(list(self._history)[-50:])
             sigma_ret = max(float(np.std(np.diff(arr))), 1e-6)
 
