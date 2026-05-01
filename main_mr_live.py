@@ -779,7 +779,7 @@ def _sync_positions_on_startup(
         base_sl    = sl_bps / 1e4 * entry_price
 
         # ── TP：Kalman fair_value（warm-up 後已有估算；mean reversion 目標）───
-        st = bot._get_or_create_state(symbol)
+        st = bot.get_state(symbol)
         kalman_fv = st.kalman.fair_value or entry_price
 
         if side == "long":
