@@ -2,9 +2,10 @@
   "AAVE/USDC:USDC": {
     "sl_timestamps": [
       1777540952.25,
-      1777570022.32
+      1777570022.32,
+      1777594502.6
     ],
-    "cooldown_until": null
+    "cooldown_until": 1777608902.6
   },
   "BCH/USDC:USDC": {
     "sl_timestamps": [
@@ -18,24 +19,35 @@
     "sl_timestamps": [
       1777526860.04,
       1777527415.27,
-      1777573942.04
+      1777573942.04,
+      1777600696.7
     ],
-    "cooldown_until": null
+    "cooldown_until": 1777615096.7
   },
   "COMP/USDC:USDC": {
     "sl_timestamps": [
       1777532417.3,
-      1777565010.3
+      1777565010.3,
+      1777598453.3
     ],
-    "cooldown_until": null
+    "cooldown_until": 1777612853.3
   },
   "ETH/USDC:USDC": {
     "sl_timestamps": [
       1777547967.28,
       1777563308.17,
-      1777570017.35
+      1777570017.35,
+      1777591257.48
     ],
-    "cooldown_until": null
+    "cooldown_until": 1777605657.48
+  },
+  "HYPE/USDC:USDC": {
+    "sl_timestamps": [
+      1777594508.37,
+      1777598450.94,
+      1777600701.63
+    ],
+    "cooldown_until": 1777615101.63
   },
   "LTC/USDC:USDC": {
     "sl_timestamps": [
@@ -43,12 +55,21 @@
     ],
     "cooldown_until": null
   },
+  "SOL/USDC:USDC": {
+    "sl_timestamps": [
+      1777589586.09
+    ],
+    "cooldown_until": null
+  },
   "TAO/USDC:USDC": {
     "sl_timestamps": [
       1777558839.35,
       1777561636.69,
-      1777586799.75
+      1777586799.75,
+      1777591262.8,
+      1777594508.37,
+      1777599580.72
     ],
-    "cooldown_until": null
+    "cooldown_until": 1777613980.72
   }
 }
