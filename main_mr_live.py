@@ -694,6 +694,124 @@ def _live_place_entry(
     logger.error("LIVE_ENTRY SHORT all attempts failed %s", symbol)
 
 
+def _sync_positions_on_startup(
+    ex: ccxt.Exchange,
+    bot: "MeanReversionBot",
+    symbols: List[str],
+    ohlcv_cache: Dict[str, List],
+    config: "BotConfig",
+) -> None:
+    """
+    重啟後從交易所讀取實際持倉，重建 bot 內部 SymbolState，並重落 bracket TP+SL。
+
+    流程：
+      1. fetch_positions() → 取所有 contracts > 0 的持倉
+      2. 只處理 symbols 幣池內的持倉（池外持倉 WARNING log，需人手處理）
+      3. 用 warm-up 後的 Kalman fair_value 作 TP（mean reversion 目標）
+      4. 用 ohlcv_cache 最後 14 根 bar 計 ATR → SL distance（與開倉邏輯一致）
+      5. 重建 SymbolState（in_position=True，entry_price，sl_price，tp_price 等）
+      6. 呼叫 _live_place_bracket() 重落 bracket orders
+
+    注意：
+      - entry_time 設為 time.time()（重啟後視為剛開倉，dynamic SL decay 重新計時）
+      - size / notional 直接從交易所取，唔依賴 bot 內部記錄
+    """
+    logger.info("STARTUP_SYNC checking exchange positions …")
+    try:
+        raw_positions = ex.fetch_positions()
+    except Exception as e:
+        logger.error("STARTUP_SYNC fetch_positions failed: %s — skipping sync", e)
+        return
+
+    open_positions = [
+        p for p in raw_positions
+        if abs(float(p.get("contracts") or 0)) > 0
+    ]
+
+    if not open_positions:
+        logger.info("STARTUP_SYNC no open positions on exchange — clean slate")
+        return
+
+    logger.info("STARTUP_SYNC found %d open position(s) on exchange", len(open_positions))
+
+    for pos in open_positions:
+        symbol      = pos.get("symbol", "")
+        side        = (pos.get("side") or "").lower()           # "long" | "short"
+        contracts   = abs(float(pos.get("contracts") or 0))
+        entry_price = float(
+            pos.get("entryPrice") or pos.get("averageEntryPrice") or 0
+        )
+        notional    = abs(float(pos.get("notional") or (contracts * entry_price)))
+
+        if not symbol or contracts <= 0 or entry_price <= 0 or side not in ("long", "short"):
+            logger.warning("STARTUP_SYNC skip malformed position: %s", pos)
+            continue
+
+        if symbol not in symbols:
+            logger.warning(
+                "STARTUP_SYNC %-30s side=%-5s size=%.6f  NOT in universe → "
+                "no bracket placed; please close manually on exchange",
+                symbol, side, contracts,
+            )
+            continue
+
+        # ── ATR from ohlcv_cache（warm-up 已跑，直接用最後 14 bars）──────────
+        ohlcv = ohlcv_cache.get(symbol, [])
+        if len(ohlcv) < 15:
+            logger.warning(
+                "STARTUP_SYNC %s insufficient ohlcv (%d bars) → skip bracket",
+                symbol, len(ohlcv),
+            )
+            continue
+
+        highs  = np.array([b[2] for b in ohlcv[-15:]], dtype=float)
+        lows   = np.array([b[3] for b in ohlcv[-15:]], dtype=float)
+        closes = np.array([b[4] for b in ohlcv[-15:]], dtype=float)
+        tr     = np.maximum(
+            highs[1:] - lows[1:],
+            np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])),
+        )
+        atr = float(np.mean(tr[-14:])) if len(tr) >= 14 else float(np.mean(tr))
+
+        # ── SL distance（與 bot._open_position 同一公式）─────────────────────
+        raw_sl_bps = config.atr_mult * atr / max(entry_price, 1e-9) * 1e4
+        sl_bps     = max(config.min_sl_bps, min(raw_sl_bps, config.max_sl_bps))
+        base_sl    = sl_bps / 1e4 * entry_price
+
+        # ── TP：Kalman fair_value（warm-up 後已有估算；mean reversion 目標）───
+        st = bot._get_or_create_state(symbol)
+        kalman_fv = st.kalman.fair_value or entry_price
+
+        if side == "long":
+            sl_price = entry_price - base_sl
+            tp_price = max(kalman_fv, entry_price + base_sl * 0.5)
+        else:
+            sl_price = entry_price + base_sl
+            tp_price = min(kalman_fv, entry_price - base_sl * 0.5)
+
+        # ── 重建 SymbolState ──────────────────────────────────────────────────
+        st.in_position       = True
+        st.position_side     = side
+        st.entry_price       = entry_price
+        st.entry_time        = time.time()   # 重新計 dynamic SL decay
+        st.entry_bar         = st.bar_count
+        st.base_sl_distance  = base_sl
+        st.sl_price          = sl_price
+        st.tp_price          = tp_price
+        st.size              = contracts
+        st.notional          = notional
+
+        logger.info(
+            "STARTUP_SYNC restored  %-30s side=%-5s  entry=%.4f  "
+            "SL=%.4f  TP=%.4f  size=%.6f  notional=%.2f  atr=%.4f",
+            symbol, side.upper(), entry_price,
+            sl_price, tp_price, contracts, notional, atr,
+        )
+
+        # ── 重落 bracket TP+SL（position 已存在，reduceOnly 可接受）──────────
+        _live_place_bracket(ex, symbol, st)
+
+
 def _live_place_exit(ex: ccxt.Exchange, symbol: str, rec) -> None:  # type: ignore[no-untyped-def]
     """
     Bot 剛剛虛擬平倉，mirror 到真實交易所。
@@ -930,6 +1048,12 @@ def main() -> None:
     bot.end_warmup()
     bot.reset_gate_diag()   # initial warm-up：clean slate 起跳
     logger.info("━━━ WARM-UP COMPLETE — %d symbols active, bot ready to trade ━━━", len(symbols))
+
+    # ── Startup Position Sync（live 模式限定）────────────────────────────────
+    # 重啟後從交易所讀取實際持倉，重建內部狀態並重落 bracket TP+SL。
+    # Paper 模式：交易所冇實際持倉，skip。
+    if not paper:
+        _sync_positions_on_startup(ex, bot, symbols, ohlcv_cache, config)
 
     last_universe_scan_ts = time.time()
 
