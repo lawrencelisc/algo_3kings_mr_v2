@@ -106,7 +106,8 @@ class KalmanZScore:
             return
         innov = np.array(self._innovations)
         # Innovation variance estimate
-        S_hat = float(np.var(innov))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            S_hat = float(np.var(innov))
         # Autocovariance lag-1
         if len(innov) > 1:
             ac1 = float(np.mean(innov[1:] * innov[:-1]))
@@ -395,9 +396,12 @@ class VolBurstDetector:
         short_rets = rets[-self.short_window:]
         if len(short_rets) < 2 or len(rets) < 2:
             return None
-        short_vol = float(np.std(short_rets, ddof=1))
-        long_vol = float(np.std(rets, ddof=1))
-        if long_vol <= 0:
+        # np.errstate 防止 ddof=1 在邊緣情況（n=1）發出 RuntimeWarning；
+        # NaN 結果由 isnan guard 接住，唔 crash。
+        with np.errstate(invalid="ignore", divide="ignore"):
+            short_vol = float(np.std(short_rets, ddof=1))
+            long_vol  = float(np.std(rets,       ddof=1))
+        if long_vol <= 0 or np.isnan(short_vol) or np.isnan(long_vol):
             return None
         return short_vol / long_vol
 
