@@ -383,9 +383,17 @@ class MeanReversionBot:
             prices_for_screen is not None
             and (state.bar_count - state.eligibility_checked_at) >= self.config.coin_rescreen_interval_bars
         ):
+            # prices_for_screen 包含 warmup 期的 1m-bar closes（最多 600）加上 live closes。
+            # half_life_ou 計算結果以「prices 的時間間隔數」為單位（主要是 1m-bar）。
+            # warmup_symbol 已把 timeout_bars 轉換為 1m-bar 等價值；
+            # 這裡也要做同樣換算，否則 HL cap 比 warmup 嚴 bar_duration/60 倍。
+            # e.g. poll_sec=180 → timeout_1m = 20 × 3 = 60 bars（比 20 寬鬆 3 倍）。
+            _timeout_1m = max(1, int(
+                self.config.timeout_bars * (self.config.bar_duration_sec / 60.0)
+            ))
             result = screen_coin(
                 prices=prices_for_screen,
-                timeout_bars=self.config.timeout_bars,
+                timeout_bars=_timeout_1m,
                 hurst_threshold=self.config.hurst_threshold,
                 hl_slack=self.config.hl_slack,
             )
@@ -800,6 +808,47 @@ class MeanReversionBot:
         如果係 initial warm-up，外面跟住可以呼叫 reset_gate_diag()。
         """
         self._in_warmup = False
+
+    def rollback_entry(self, symbol: str) -> None:
+        """
+        撤銷 _try_entry() 剛剛建立嘅虛擬倉位。
+
+        適用場景：bot.on_bar() 內部已開倉（state.in_position=True），
+        但外部邏輯（cooldown / jail / regime_pause）決定唔落真實訂單。
+        若不 rollback，下一 bar _manage_position() 會對一個交易所不存在的幻象倉位
+        進行管理，最終 _live_place_exit() 會遇到 "would increase position" 錯誤，
+        且 bot 內部 equity 會因虛假出場而失真。
+
+        Rollback 步驟：
+          1. 清 in_position / position_side
+          2. 退還 entry fee（已從 equity 扣）
+          3. reset SL cooldown（唔 penalize 冇落到單）
+          4. gate stats 的 opens -= 1（唔計呢次為真實開倉）
+        """
+        state = self.get_state(symbol)
+        if not state.in_position:
+            return
+        # 退還開倉費（加返去 equity）
+        self.account.equity += state.entry_fee
+        self.account.total_fee_paid -= state.entry_fee
+        # 清倉狀態
+        state.in_position = False
+        state.position_side = None
+        state.entry_fee = 0.0
+        state.base_sl_distance = 0.0
+        state.sl_price = 0.0
+        state.tp_price = 0.0
+        state.size = 0.0
+        state.notional = 0.0
+        state.size_mult = 1.0
+        state.z_at_entry = 0.0
+        state.vpin_pct_at_entry = 0.0
+        # SL cooldown 唔設（未入場，不應有 cooldown 懲罰）
+        state.sl_cooldown_until_bar = 0
+        # gate stats 修正
+        if self._gate_stats.get("opens", 0) > 0:
+            self._gate_stats["opens"] -= 1
+        logger.info("ENTRY_ROLLBACK  %s  virtual position cleared (live order was blocked)", symbol)
 
     def reset_gate_diag(self) -> None:
         """

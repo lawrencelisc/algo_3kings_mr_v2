@@ -55,6 +55,7 @@ class CoinEligibility:
     half_life_bars: Optional[float]
     eligible: bool
     reason: str
+    reason_code: str = ""   # "data" | "vr" | "hl" | "ok"（供 gate funnel breakdown 用）
 
 
 def screen_coin(
@@ -90,33 +91,38 @@ def screen_coin(
     if vr is None:
         return CoinEligibility(
             symbol="", hurst=None, half_life_bars=None,
-            eligible=False, reason="insufficient_data_for_VR (need 22+ bars)"
+            eligible=False, reason="insufficient_data_for_VR (need 22+ bars)",
+            reason_code="data",
         )
 
     if vr >= vr_threshold:
         return CoinEligibility(
             symbol="", hurst=h_equiv, half_life_bars=hl,
             eligible=False,
-            reason=f"VR={vr:.3f}>={vr_threshold:.2f} (trending/random walk)"
+            reason=f"VR={vr:.3f}>={vr_threshold:.2f} (trending/random walk)",
+            reason_code="vr",
         )
 
     if hl is None:
         return CoinEligibility(
             symbol="", hurst=h_equiv, half_life_bars=None,
-            eligible=False, reason="half_life: β>=0 (trending) or insufficient data"
+            eligible=False, reason="half_life: beta>=0 (trending) or insufficient data",
+            reason_code="hl",
         )
 
     if hl > timeout_bars * hl_slack:
         return CoinEligibility(
             symbol="", hurst=h_equiv, half_life_bars=hl,
             eligible=False,
-            reason=f"HL={hl:.1f}bars > timeout×slack={timeout_bars * hl_slack:.1f}"
+            reason=f"HL={hl:.1f}bars > timeout*slack={timeout_bars * hl_slack:.1f}",
+            reason_code="hl",
         )
 
     return CoinEligibility(
         symbol="", hurst=h_equiv, half_life_bars=hl,
         eligible=True,
-        reason=f"ok: VR={vr:.3f} (H≈{h_equiv:.3f}) HL={hl:.1f}bars"
+        reason=f"ok: VR={vr:.3f} (H~{h_equiv:.3f}) HL={hl:.1f}bars",
+        reason_code="ok",
     )
 
 

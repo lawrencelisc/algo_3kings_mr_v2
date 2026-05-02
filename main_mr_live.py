@@ -177,7 +177,7 @@ class LiquidationTracker:
 #
 class RegimePauseGuard:
     """
-    全局 SL 熔斷 + VR-gated resume。
+    全局 SL 熔斷 + VR-gated resume（含重啟持久化）。
 
     觸發：window_hours 內全局 SL 次數 >= sl_threshold → 暫停 pause_hours 小時。
     解除：到期後唔自動恢復，要 check_resume() 通過 VR-gated check
@@ -186,6 +186,9 @@ class RegimePauseGuard:
 
     VR < 0.9 = mean reverting；若 universe 中 60%+ 幣已恢復 mean reverting，
     代表 trending wave 已過，可安全恢復；否則繼續凍結。
+
+    持久化（regime_pause_state.json）：
+      重啟後自動恢復 _pause_until 和 _sl_ts，確保熔斷狀態唔因重啟而消失。
     """
     def __init__(
         self,
@@ -195,6 +198,7 @@ class RegimePauseGuard:
         vr_resume_threshold: float = 0.9,
         vr_resume_min_ratio: float = 0.6,
         extend_hours: float  = 1.0,
+        state_path: str = "regime_pause_state.json",
     ) -> None:
         self.sl_threshold = sl_threshold
         self.pause_hours  = pause_hours
@@ -202,9 +206,53 @@ class RegimePauseGuard:
         self.vr_resume_threshold = vr_resume_threshold
         self.vr_resume_min_ratio = vr_resume_min_ratio
         self.extend_hours = extend_hours
+        self._state_path  = state_path
         self._sl_ts:      deque = deque()
         self._pause_until: float = 0.0
         self._last_resume_check: float = 0.0   # 防止短時間內重覆 check
+        self._load()
+
+    def _load(self) -> None:
+        """重啟時恢復熔斷狀態。"""
+        if not os.path.isfile(self._state_path):
+            return
+        try:
+            import json as _json
+            with open(self._state_path) as f:
+                d = _json.load(f)
+            now = time.time()
+            cutoff = now - self.window_hours * 3600
+            sl_ts = [t for t in d.get("sl_ts", []) if t > cutoff]
+            self._sl_ts = deque(sl_ts)
+            self._pause_until = float(d.get("pause_until", 0.0))
+            if self._pause_until > now:
+                logger.warning(
+                    "RegimePauseGuard RESTORED: still paused until %s UTC  (%.1fh remaining)",
+                    time.strftime("%H:%M", time.gmtime(self._pause_until)),
+                    (self._pause_until - now) / 3600,
+                )
+            else:
+                self._pause_until = 0.0
+            logger.info(
+                "RegimePauseGuard loaded: %d SL timestamps in %.0fh window",
+                len(self._sl_ts), self.window_hours,
+            )
+        except Exception as e:
+            logger.warning("RegimePauseGuard: failed to load state (%s) — fresh start", e)
+
+    def _save(self) -> None:
+        try:
+            import json as _json
+            data = {
+                "pause_until": self._pause_until,
+                "sl_ts": list(self._sl_ts),
+            }
+            tmp = self._state_path + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump(data, f)
+            os.replace(tmp, self._state_path)
+        except Exception as e:
+            logger.warning("RegimePauseGuard: failed to save state (%s)", e)
 
     def record_sl(self, symbol: str) -> None:
         """每次 SL 出場後呼叫。若觸發熔斷，log WARNING 並設 pause_until。"""
@@ -215,11 +263,12 @@ class RegimePauseGuard:
         if count >= self.sl_threshold and now > self._pause_until:
             self._pause_until = now + self.pause_hours * 3600
             logger.warning(
-                "🛑 REGIME_PAUSE triggered: %d SL in %.0fh → "
+                "REGIME_PAUSE triggered: %d SL in %.0fh → "
                 "freeze new entries for %.0fh  (until %s UTC)",
                 count, self.window_hours, self.pause_hours,
                 time.strftime("%H:%M", time.gmtime(self._pause_until)),
             )
+        self._save()
 
     def check_resume(self, vr_values: Dict[str, Optional[float]]) -> None:
         """
@@ -251,8 +300,8 @@ class RegimePauseGuard:
 
         if ratio >= self.vr_resume_min_ratio:
             logger.warning(
-                "✅ REGIME_PAUSE RESUMED: %d/%d (%.0f%%) symbols mean-reverting "
-                "(VR<%.2f) ≥ %.0f%% threshold → entries unblocked",
+                "REGIME_PAUSE RESUMED: %d/%d (%.0f%%) symbols mean-reverting "
+                "(VR<%.2f) >= %.0f%% threshold → entries unblocked",
                 n_mr, len(valid), ratio * 100,
                 self.vr_resume_threshold, self.vr_resume_min_ratio * 100,
             )
@@ -266,6 +315,7 @@ class RegimePauseGuard:
                 self.extend_hours,
                 time.strftime("%H:%M", time.gmtime(self._pause_until)),
             )
+        self._save()
 
     def is_paused(self) -> bool:
         """返回 True → 禁止新開倉；False → 正常。"""
@@ -1122,16 +1172,11 @@ def main() -> None:
     bot = MeanReversionBot(config)
 
     # ── Risk Controls ────────────────────────────────────────────────────────
-    corr_guard = CorrelationGuard(
-        window=int(os.environ.get("MR_CORR_WINDOW", "200")),
-        threshold=float(os.environ.get("MR_CORR_THRESHOLD", "0.6")),
-        avg_threshold=float(os.environ.get("MR_CORR_AVG_THRESHOLD", "0.5")),
-    )
-    dd_throttle = DrawdownThrottle(
-        window_sec=float(os.environ.get("MR_DD_WINDOW_SEC", "3600")),
-        dd_limit=float(os.environ.get("MR_DD_LIMIT", "0.005")),
-        throttle_mult=float(os.environ.get("MR_DD_THROTTLE_MULT", "0.5")),
-    )
+    # corr_guard / dd_throttle 由 bot 內部實例負責實際交易決策（on_bar 使用）。
+    # 此處保留 alias 指向 bot 內部實例，供 SUMMARY log 顯示正確狀態。
+    # 不再建立獨立實例（避免兩個實例各自更新，互不同步導致狀態矛盾）。
+    corr_guard  = bot.corr_guard
+    dd_throttle = bot.dd_throttle
 
     # ── Cooldown Manager ────────────────────────────────────────────────────
     cooldown_path = os.environ.get("MR_COOLDOWN_FILE", "cooldown_state.json")
@@ -1426,23 +1471,8 @@ def main() -> None:
             buy_flow  = volume * 0.5 * (1 + (1 if price_chg > 0 else -1) * 0.3)
             sell_flow = volume - buy_flow
 
-            # ── Cooldown check（入場前）────────────────────────────────────
-            # 不影響已有持倉管理，只阻止開新倉
-            _st_cd = bot.get_state(sym)
-            if not _st_cd.in_position and cooldown.is_cooling(sym):
-                rem_h = cooldown.remaining_sec(sym) / 3600
-                logger.info(
-                    "COOLDOWN  %s  skip entry (剩 %.1fh  24h_SL=%d)",
-                    sym, rem_h, cooldown.sl_count_24h(sym),
-                )
-                # 仍要繼續 on_bar 管理已有持倉（不 continue）
-
-            # ── CorrelationGuard（入場前）──────────────────────────────────
-            # 更新 rolling return（持倉中的幣都要 update）
-            corr_guard.update(sym, close)
-
-            # ── DrawdownThrottle 更新 ───────────────────────────────────────
-            dd_throttle.update(bot.account.equity)
+            # CorrelationGuard 和 DrawdownThrottle 由 bot.on_bar() 內部更新，
+            # 唔需要在主循環重複呼叫（bot.corr_guard / bot.dd_throttle 係同一實例）。
 
             # Snapshot 入場前持倉狀態，用嚟偵測新開倉
             _st_before = bot.get_state(sym)
@@ -1499,20 +1529,39 @@ def main() -> None:
                 _st_after = bot.get_state(sym)
 
                 # ── 新開倉：bot 剛剛由無倉 → 有倉 ──────────────────────────
+                # 優先順序：cooldown > jail > regime_pause > 正常落單
+                # 若任何 guard block，必須 rollback bot 內部狀態（否則下一 bar
+                # _manage_position 會對交易所不存在的幻象倉位下平倉單）。
                 if not _was_in_pos and _st_after.in_position:
-                    # 防禦性檢查（坐監幣理應已從 symbols 移除）
-                    if jail.is_jailed(sym):
+                    _entry_blocked = False
+
+                    if not _st_cd.in_position and cooldown.is_cooling(sym):
+                        rem_h = cooldown.remaining_sec(sym) / 3600
                         logger.warning(
-                            "JAIL  %s  new entry blocked — 坐監中 [%s]",
+                            "COOLDOWN  %s  entry blocked — 坐監中 %.1fh (24h_SL=%d) → rollback",
+                            sym, rem_h, cooldown.sl_count_24h(sym),
+                        )
+                        _entry_blocked = True
+
+                    elif jail.is_jailed(sym):
+                        logger.warning(
+                            "JAIL  %s  entry blocked — 坐監中 [%s] → rollback",
                             sym, jail.status_dict(sym).get("trigger", "unknown"),
                         )
+                        _entry_blocked = True
+
                     elif regime_pause.is_paused():
                         logger.warning(
-                            "REGIME_PAUSE  %s  new entry blocked — "
-                            "global SL熔斷中（%.1fh remaining, 24h_SL=%d）",
+                            "REGIME_PAUSE  %s  entry blocked — "
+                            "global SL熔斷 %.1fh remaining (24h_SL=%d) → rollback",
                             sym, regime_pause.remaining_hours(),
                             regime_pause.sl_count_24h(),
                         )
+                        _entry_blocked = True
+
+                    if _entry_blocked:
+                        # Rollback 虛擬倉位：退費、清 state、唔落單
+                        bot.rollback_entry(sym)
                     else:
                         _live_place_entry(ex, sym, _st_after, ob_bids=bid_lvls, ob_asks=ask_lvls)
 
