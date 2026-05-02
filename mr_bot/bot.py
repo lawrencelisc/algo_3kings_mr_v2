@@ -157,6 +157,10 @@ class BotConfig:
     # SL 冷卻期：止損後同一幣種至少等幾多 bars 才可再入場（防接刀）
     sl_cooldown_bars: int = 3       # default 3 bars（3m bar = 9 分鐘冷靜期）
 
+    # DECEL exit 最少持倉 bars：防止「入場後 1-2 bar 就 z 回歸 → 強制 exit」
+    # 嘅微利出場（fee × 2 已食晒），俾 mean reversion 至少 N bars 走完。
+    decel_min_hold_bars: int = 3
+
     # SL config
     atr_mult: float = 1.0
     # SL bps 上下限（自適應跨幣種，唔需要 WFA）：
@@ -614,7 +618,7 @@ class MeanReversionBot:
         side = state.position_side
         assert side is not None
 
-        # 動態 SL 距離
+        # 動態 SL 距離（trailing-only：唔隨時間收緊）
         current_sl_dist = compute_sl_distance(
             base_sl=state.base_sl_distance,
             entry_time=state.entry_time,
@@ -624,13 +628,26 @@ class MeanReversionBot:
             regime_zone=regime_zone,
         )
 
-        # 更新 SL price（只收緊，唔放鬆）
+        # ── Trailing SL：賺到 trigger × ATR 後鎖部分利潤 ──────────────────────
+        # base trailing 從 entry ± current_sl_dist 計起，再睇有冇符合 trail 條件
+        sl_cfg = self.config.sl_config
+        trail_trigger = sl_cfg.trail_trigger_atr * atr
+        trail_lock    = sl_cfg.trail_lock_atr * atr
+
         if side == "long":
-            new_sl = state.entry_price - current_sl_dist
-            state.sl_price = max(state.sl_price, new_sl)
+            base_new_sl = state.entry_price - current_sl_dist
+            # 若已賺超過 trigger → SL trail 上 entry + trail_lock
+            if (close - state.entry_price) >= trail_trigger:
+                trail_sl = state.entry_price + trail_lock
+                base_new_sl = max(base_new_sl, trail_sl)
+            # 只 move 向有利方向（向上）；trending follow 唔 shrink
+            state.sl_price = max(state.sl_price, base_new_sl)
         else:
-            new_sl = state.entry_price + current_sl_dist
-            state.sl_price = min(state.sl_price, new_sl)
+            base_new_sl = state.entry_price + current_sl_dist
+            if (state.entry_price - close) >= trail_trigger:
+                trail_sl = state.entry_price - trail_lock
+                base_new_sl = min(base_new_sl, trail_sl)
+            state.sl_price = min(state.sl_price, base_new_sl)
 
         # 檢查出場條件（優先順序：TP > REGIME_RED > SL > ADVERSE_FLOW > TIMEOUT > DECEL）
         reason: Optional[str] = None
@@ -664,12 +681,18 @@ class MeanReversionBot:
             if bars_held >= self.config.timeout_bars:
                 reason = "TIMEOUT"
 
-        # DECEL（Z-score 回歸，即 mean reversion 大致完成）
+        # DECEL（Z-score 回歸長期 mean，mean reversion 大致完成）
+        # OU-anchored Kalman 修正後：z 反映「price 偏離長期 mean 多少 σ」，
+        # 入場 z=±2 → DECEL z=±0.5 = 確實已完成 75% reversion。
+        # min_hold_bars guard：防止「入場後 1-2 bar 就 DECEL」嘅冇邊際 trade
+        # （fee × 2 已食晒 0.5σ 嘅 P&L）。
         if reason is None and z is not None:
-            if side == "long" and z >= -0.5:
-                reason = "DECEL"
-            elif side == "short" and z <= 0.5:
-                reason = "DECEL"
+            bars_held_check = state.bar_count - state.entry_bar
+            if bars_held_check >= self.config.decel_min_hold_bars:
+                if side == "long" and z >= -0.5:
+                    reason = "DECEL"
+                elif side == "short" and z <= 0.5:
+                    reason = "DECEL"
 
         if reason is None:
             return None

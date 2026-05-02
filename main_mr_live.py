@@ -162,6 +162,126 @@ class LiquidationTracker:
         return abs(arr[-1] - mean_oi) / std_oi > self.spike_threshold
 
 
+# ── RegimePauseGuard ─────────────────────────────────────────────────────────
+#
+# 全局熔斷機制：當 rolling 24h 內全 universe SL 次數超過閾值，
+# 暫停所有新開倉 N 小時。
+# 比 per-symbol cooldown 更宏觀——能提前避開大型 trending wave。
+#
+# 設計原則：
+#   - 只阻止「新開倉」，唔影響已有持倉管理（SL / TP / TIMEOUT 仍正常執行）
+#   - 每次熔斷 log 清晰，包括觸發原因、預計解除時間
+#   - 熔斷解除後自動恢復，唔需要人手干預
+#
+class RegimePauseGuard:
+    """
+    全局 SL 熔斷 + VR-gated resume。
+
+    觸發：window_hours 內全局 SL 次數 >= sl_threshold → 暫停 pause_hours 小時。
+    解除：到期後唔自動恢復，要 check_resume() 通過 VR-gated check
+          （universe 中 VR < vr_resume_threshold 嘅幣 >= vr_resume_min_ratio）。
+          否則延長 extend_hours，再下次到期再 check。
+
+    VR < 0.9 = mean reverting；若 universe 中 60%+ 幣已恢復 mean reverting，
+    代表 trending wave 已過，可安全恢復；否則繼續凍結。
+    """
+    def __init__(
+        self,
+        sl_threshold: int    = 8,
+        pause_hours:  float  = 4.0,
+        window_hours: float  = 24.0,
+        vr_resume_threshold: float = 0.9,
+        vr_resume_min_ratio: float = 0.6,
+        extend_hours: float  = 1.0,
+    ) -> None:
+        self.sl_threshold = sl_threshold
+        self.pause_hours  = pause_hours
+        self.window_hours = window_hours
+        self.vr_resume_threshold = vr_resume_threshold
+        self.vr_resume_min_ratio = vr_resume_min_ratio
+        self.extend_hours = extend_hours
+        self._sl_ts:      deque = deque()
+        self._pause_until: float = 0.0
+        self._last_resume_check: float = 0.0   # 防止短時間內重覆 check
+
+    def record_sl(self, symbol: str) -> None:
+        """每次 SL 出場後呼叫。若觸發熔斷，log WARNING 並設 pause_until。"""
+        now = time.time()
+        self._sl_ts.append(now)
+        self._trim(now)
+        count = len(self._sl_ts)
+        if count >= self.sl_threshold and now > self._pause_until:
+            self._pause_until = now + self.pause_hours * 3600
+            logger.warning(
+                "🛑 REGIME_PAUSE triggered: %d SL in %.0fh → "
+                "freeze new entries for %.0fh  (until %s UTC)",
+                count, self.window_hours, self.pause_hours,
+                time.strftime("%H:%M", time.gmtime(self._pause_until)),
+            )
+
+    def check_resume(self, vr_values: Dict[str, Optional[float]]) -> None:
+        """
+        到期時呼叫一次（main loop 每輪檢查）。
+        若 universe 中 VR < vr_resume_threshold 嘅幣比例 >= vr_resume_min_ratio
+        → 解除 pause；否則延長 extend_hours。
+        vr_values: {symbol: vr_or_None}（None = 資料不足）
+        """
+        now = time.time()
+        # 未到期；或剛 check 過（防 spam）
+        if now < self._pause_until:
+            return
+        if now - self._last_resume_check < 60:   # 至少間隔 60s
+            return
+        self._last_resume_check = now
+
+        valid = [v for v in vr_values.values() if v is not None]
+        if not valid:
+            # 完全冇 VR 資料 → 保守延長
+            self._pause_until = now + self.extend_hours * 3600
+            logger.warning(
+                "REGIME_PAUSE: no VR data available → extend %.0fh",
+                self.extend_hours,
+            )
+            return
+
+        n_mr = sum(1 for v in valid if v < self.vr_resume_threshold)
+        ratio = n_mr / len(valid)
+
+        if ratio >= self.vr_resume_min_ratio:
+            logger.warning(
+                "✅ REGIME_PAUSE RESUMED: %d/%d (%.0f%%) symbols mean-reverting "
+                "(VR<%.2f) ≥ %.0f%% threshold → entries unblocked",
+                n_mr, len(valid), ratio * 100,
+                self.vr_resume_threshold, self.vr_resume_min_ratio * 100,
+            )
+            # 已自動到期（now >= _pause_until），唔需要再 reset
+        else:
+            self._pause_until = now + self.extend_hours * 3600
+            logger.warning(
+                "REGIME_PAUSE: only %d/%d (%.0f%%) mean-reverting < %.0f%% threshold "
+                "→ extend %.0fh (until %s UTC)",
+                n_mr, len(valid), ratio * 100, self.vr_resume_min_ratio * 100,
+                self.extend_hours,
+                time.strftime("%H:%M", time.gmtime(self._pause_until)),
+            )
+
+    def is_paused(self) -> bool:
+        """返回 True → 禁止新開倉；False → 正常。"""
+        return time.time() < self._pause_until
+
+    def sl_count_24h(self) -> int:
+        self._trim(time.time())
+        return len(self._sl_ts)
+
+    def remaining_hours(self) -> float:
+        return max(0.0, (self._pause_until - time.time()) / 3600)
+
+    def _trim(self, now: float) -> None:
+        cutoff = now - self.window_hours * 3600
+        while self._sl_ts and self._sl_ts[0] < cutoff:
+            self._sl_ts.popleft()
+
+
 # ── Universe Scanner ─────────────────────────────────────────────────────────
 
 _UNIVERSE_EXCLUDE_PREFIXES = ("XYZ-",)   # 合成資產（tokenized stocks/commodities）
@@ -521,7 +641,6 @@ def _live_place_bracket(
         logger.warning("LIVE_SL failed %s: %s (internal SL still active)", symbol, e)
 
     _live_orders[symbol] = orders
-
 
 def _live_cancel_bracket(ex: ccxt.Exchange, symbol: str) -> None:
     """
@@ -995,6 +1114,18 @@ def main() -> None:
     )
     # 重啟時顯示 cooldown 狀態，讓交易者知道哪些幣種在坐監
     cooldown.log_status()
+
+    # ── RegimePauseGuard（全局 SL 熔斷）───────────────────────────────────────
+    # MR_GLOBAL_SL_THRESHOLD: 24h 內全局 SL 超過此數 → 暫停開新倉（default 8）
+    # MR_GLOBAL_SL_PAUSE_H:   熔斷暫停時數（default 4h）
+    regime_pause = RegimePauseGuard(
+        sl_threshold=int(os.environ.get("MR_GLOBAL_SL_THRESHOLD", "8")),
+        pause_hours=float(os.environ.get("MR_GLOBAL_SL_PAUSE_H", "4.0")),
+    )
+    logger.info(
+        "RegimePauseGuard: sl_threshold=%d/24h → pause=%.0fh",
+        regime_pause.sl_threshold, regime_pause.pause_hours,
+    )
     ex  = _make_exchange()
     ex.load_markets()
 
@@ -1029,6 +1160,21 @@ def main() -> None:
         symbols_raw = os.environ.get("MR_SYMBOLS", DEFAULT_SYMBOLS)
         symbols     = [s.strip() for s in symbols_raw.split(",") if s.strip()]
 
+    # ── MR_EXCLUDE_SYMBOLS：暫時排除已確認 trending 主導的幣 ────────────────
+    # 格式：逗號分隔，例如 "COMP/USDC:USDC,BCH/USDC:USDC"
+    # 排除後唔影響已有持倉（持倉照常管理直到自然出場）
+    exclude_raw = os.environ.get("MR_EXCLUDE_SYMBOLS", "").strip()
+    excluded_set: set = set()
+    if exclude_raw:
+        excluded_set = {s.strip() for s in exclude_raw.split(",") if s.strip()}
+        before_count = len(symbols)
+        symbols = [s for s in symbols if s not in excluded_set]
+        logger.warning(
+            "MR_EXCLUDE_SYMBOLS: removed %d symbol(s) from universe: %s",
+            before_count - len(symbols),
+            sorted(excluded_set & {s for s in excluded_set}),
+        )
+
     logger.info("Active symbols (%d): %s", len(symbols), symbols)
 
     # ── Warm-up ─────────────────────────────────────────────────────────────
@@ -1060,6 +1206,16 @@ def main() -> None:
     # ── Main Loop ────────────────────────────────────────────────────────────
     while True:
         loop_start = time.time()
+
+        # ── VR-gated RegimePause Resume Check（每輪檢查一次）──────────────────
+        # 到期後唔自動恢復，要 60% universe VR<0.9 先解禁；否則延長 1h。
+        # state.hurst_val = VR×0.5（係 hurst-equivalent，*2 還原 VR）
+        if regime_pause._pause_until > 0 and time.time() >= regime_pause._pause_until:
+            vr_snapshot: Dict[str, Optional[float]] = {}
+            for _sym in symbols:
+                _h = bot.get_state(_sym).hurst_val
+                vr_snapshot[_sym] = (_h * 2.0) if _h is not None else None
+            regime_pause.check_resume(vr_snapshot)
 
         # ── Periodic Universe Rescan ────────────────────────────────────────
         if universe_scan and (loop_start - last_universe_scan_ts) >= universe_rescan_sec:
@@ -1190,23 +1346,33 @@ def main() -> None:
                 prices_for_screen=prices_cache[sym] if len(prices_cache[sym]) >= 200 else None,
             )
 
-            # ── SL → 觸發 cooldown ──────────────────────────────────────────
+            # ── SL → 觸發 per-symbol cooldown + global RegimePauseGuard ────
             if rec is not None and rec.reason == "SL":
                 triggered = cooldown.record_sl(sym)
                 if triggered:
-                    # 在坐監列表中顯示
                     rem_h = cooldown.remaining_sec(sym) / 3600
                     logger.warning(
                         "🚫 %s 進入 cooldown %.1fh（24h 第 %d 次 SL）",
                         sym, rem_h, cooldown.sl_count_24h(sym),
                     )
+                # 每次 SL 都通知 global 熔斷計數（唔管 per-symbol cooldown 是否觸發）
+                regime_pause.record_sl(sym)
 
             if not paper:
                 _st_after = bot.get_state(sym)
 
                 # ── 新開倉：bot 剛剛由無倉 → 有倉 ──────────────────────────
                 if not _was_in_pos and _st_after.in_position:
-                    _live_place_entry(ex, sym, _st_after, ob_bids=bid_lvls, ob_asks=ask_lvls)
+                    # 若全局熔斷啟動，取消開倉（唔落 entry order）
+                    if regime_pause.is_paused():
+                        logger.warning(
+                            "REGIME_PAUSE  %s  new entry blocked — "
+                            "global SL熔斷中（%.1fh remaining, 24h_SL=%d）",
+                            sym, regime_pause.remaining_hours(),
+                            regime_pause.sl_count_24h(),
+                        )
+                    else:
+                        _live_place_entry(ex, sym, _st_after, ob_bids=bid_lvls, ob_asks=ask_lvls)
 
                 # ── 平倉：bot 返回 TradeRecord ──────────────────────────────
                 if rec is not None:
@@ -1216,14 +1382,21 @@ def main() -> None:
         if int(loop_start) % 600 < int(poll_sec):
             s = bot.summary()
             cooling_list = cooldown.all_cooling()
+            pause_str = (
+                f"PAUSED {regime_pause.remaining_hours():.1f}h "
+                f"(24h_SL={regime_pause.sl_count_24h()})"
+                if regime_pause.is_paused()
+                else f"ok (24h_SL={regime_pause.sl_count_24h()}/{regime_pause.sl_threshold})"
+            )
             logger.info(
                 "SUMMARY  equity=%.2f  pnl=%+.4f  trades=%d  "
                 "win_rate=%.1f%%  PF=%.3f  fee_paid=%.4f  "
-                "dd=%s  cooling=%s",
+                "dd=%s  regime=%s  cooling=%s",
                 s["equity"], s["pnl"], s["trades"],
                 s.get("win_rate", 0), s.get("profit_factor", 0),
                 s.get("total_fee_paid", 0),
                 dd_throttle.status_str(),
+                pause_str,
                 cooling_list if cooling_list else "none",
             )
 
