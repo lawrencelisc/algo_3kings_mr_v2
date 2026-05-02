@@ -1535,7 +1535,8 @@ def main() -> None:
                 if not _was_in_pos and _st_after.in_position:
                     _entry_blocked = False
 
-                    if not _st_cd.in_position and cooldown.is_cooling(sym):
+                    # 已在 `if not _was_in_pos` 條件內，毋須再 check _st_cd.in_position
+                    if cooldown.is_cooling(sym):
                         rem_h = cooldown.remaining_sec(sym) / 3600
                         logger.warning(
                             "COOLDOWN  %s  entry blocked — 坐監中 %.1fh (24h_SL=%d) → rollback",
