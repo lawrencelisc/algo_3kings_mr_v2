@@ -612,6 +612,8 @@ def _live_place_bracket(
         return
 
     # ── TP：limit + postOnly + reduceOnly @ tp_price ──────────────────────
+    # 若 postOnly 被 reject（市價已到 TP level）→ 改用 market IOC 即時平倉攞利潤。
+    # 「postOnly rejected」代表入場後市場已 move 到 TP 或更好水平，應即時鎖利。
     try:
         tp_px = ex.price_to_precision(symbol, state.tp_price)
         tp_order = ex.create_order(
@@ -623,6 +625,30 @@ def _live_place_bracket(
             "LIVE_TP  %s %s  qty=%s  px=%s  order_id=%s",
             exit_side.upper(), symbol, amount_str, tp_px, orders["tp"],
         )
+    except ccxt.InvalidOrder as e:
+        if "immediately matched" in str(e) or "Post only" in str(e):
+            # 市價已達 TP level → 立即 market exit 鎖利，唔需要掛 resting limit
+            logger.info(
+                "LIVE_TP postOnly crossed %s → market exit immediately (price at TP)",
+                symbol,
+            )
+            try:
+                mkt_order = ex.create_order(
+                    symbol, "market", exit_side, float(amount_str),
+                    float(tp_px), {"reduceOnly": True, "slippage": 0.05},
+                )
+                logger.info(
+                    "LIVE_TP market exit  %s %s  qty=%s  order_id=%s",
+                    exit_side.upper(), symbol, amount_str,
+                    mkt_order.get("id", "?"),
+                )
+                # TP 已即時執行，唔需要 SL bracket，直接 return
+                _live_orders[symbol] = {"tp": mkt_order.get("id"), "sl": None}
+                return
+            except Exception as me:
+                logger.warning("LIVE_TP market exit failed %s: %s", symbol, me)
+        else:
+            logger.warning("LIVE_TP failed %s: %s (internal TP still active)", symbol, e)
     except Exception as e:
         logger.warning("LIVE_TP failed %s: %s (internal TP still active)", symbol, e)
 
