@@ -186,22 +186,25 @@ def compute_regime_zone(sig: RegimeSignals) -> tuple[RegimeZone, str]:
 @dataclass
 class DynamicSLConfig:
     """
-    SL 分三段：
-      Phase 1（0 到 phase1_end_frac × half_life）：full SL
-      Phase 2（phase1_end 到 phase2_end_frac × half_life）：sl_phase2_mult × SL
-      Phase 3（之後）：sl_phase3_mult × SL
+    Trailing SL 配置（取代舊嘅 phase shrinking）。
 
-    分段係 heuristic（Opus 4.6 建議），唔係 curve fitting，
-    所以唔存在 overfit 問題——呢三個 ratio 係有 economic rationale 嘅：
-      如果 half-life 內未 revert，edge 已大幅衰減，應該收緊。
+    舊版（phase shrinking）：持倉越久 SL 越緊，trending 時主動收近 entry，
+    加快 stopout——已證明係 trending market 嘅毒藥。
+
+    新版（trailing-only）：
+      - SL 距離永遠保持 base_sl（唔隨時間收緊）
+      - 但若已賺超過 trail_trigger_atr × ATR：
+          → SL trail 到 entry ± trail_lock_atr × ATR（鎖部分利潤）
+      - 適用於 trending 市場（reward/risk 不會隨時間惡化）
+        亦適用於正常 mean reversion（賺到位再縮 SL）
+
+    Regime override 保留（YELLOW/RED 仍縮 SL，因為毒性高應快速 flush）。
 
     atr_mult：ATR-normalized SL 距離（per coin / per vol regime）
     """
     atr_mult: float = 1.0           # SL 距離 = atr_mult × ATR
-    phase1_end_frac: float = 0.5    # 前 50% half-life：full SL
-    phase2_end_frac: float = 1.0    # 50-100% half-life：0.7x SL
-    sl_phase2_mult: float = 0.7
-    sl_phase3_mult: float = 0.5     # >100% half-life：0.5x SL
+    trail_trigger_atr: float = 1.0  # 賺超過 1 × ATR 才開始 trail
+    trail_lock_atr:    float = 0.3  # trail 到 entry ± 0.3 × ATR
 
 
 def compute_sl_distance(
@@ -215,24 +218,17 @@ def compute_sl_distance(
     """
     計算當前 SL 距離（以 price 為單位）。
 
+    Trailing-only 設計：SL 距離永遠 = base_sl（唔隨時間收緊），
+    但 _manage_position 會用 trail_trigger_atr / trail_lock_atr 決定
+    SL price 是否要 move 向更有利方向（只 move，唔 shrink）。
+
+    Regime override：YELLOW 縮 50%，RED 縮 30%（毒性高應快速 flush）。
+
     base_sl：入場時嘅初始 SL 距離（atr_mult × ATR）
-    half_life_bars：幣種估計嘅 half-life（bar 數）
-    bar_duration_sec：每根 bar 係幾多秒（e.g. 60 for 1m）
+    half_life_bars / bar_duration_sec：保留作向後兼容（已不再使用）
     """
-    elapsed_sec = time.time() - entry_time
-    elapsed_bars = elapsed_sec / bar_duration_sec
-    half_life_sec = half_life_bars * bar_duration_sec
+    sl_dist = base_sl
 
-    frac = elapsed_bars / max(half_life_bars, 0.1)
-
-    if frac < config.phase1_end_frac:
-        sl_dist = base_sl
-    elif frac < config.phase2_end_frac:
-        sl_dist = base_sl * config.sl_phase2_mult
-    else:
-        sl_dist = base_sl * config.sl_phase3_mult
-
-    # Regime override：Yellow 額外縮 50%，Red 縮 30%（即快速 flush）
     if regime_zone == RegimeZone.YELLOW:
         sl_dist *= 0.5
     elif regime_zone == RegimeZone.RED:

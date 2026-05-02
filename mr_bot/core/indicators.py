@@ -62,32 +62,59 @@ def microprice_from_ob(levels: List[Tuple[float, float]], side_sign: int = 1) ->
 
 class KalmanZScore:
     """
-    將 price series 建模為 local level model：
-        x_t = x_{t-1} + w_t,  w ~ N(0, Q)   ← latent fair value
-        y_t = x_t + v_t,      v ~ N(0, R)   ← 觀測 microprice
+    Mean-reverting Kalman Filter（OU-anchored local level model）。
+
+    舊版（pure local level）：
+        x_t = x_{t-1} + w_t           ← fair value 跟住 price 漂（無 mean reversion）
+        y_t = x_t + v_t
+
+    新版（OU-drift）：
+        x_t = x_{t-1} + θ × (μ_t - x_{t-1}) + w_t   ← fair value 朝長期 mean μ_t 收斂
+        y_t = x_t + v_t
+        μ_t = (1-α) × μ_{t-1} + α × y_t              ← 長期 mean 用 slow EMA
+
+    呢個改動係根本性嘅：
+      pure local level 喺 trending market 會 follow trend，
+      令 z-score 永遠細，bot 開倉時誤以為 mean reversion，實際冇。
+      OU drift 強制 fair value 朝長期 EMA 收斂，
+      z-score 真正反映「price 偏離長期 mean 多少 σ」。
 
     Z-score = (y_t - x̂_{t|t-1}) / sqrt(P_{t|t-1} + R)
 
-    Q/R ratio 用 rolling MLE 估（warm-up 完成後自動更新），
-    唔係手動設定，避免 overfit。
-
-    Attributes
+    Parameters
     ----------
     warm_up : int
         啟動 MLE 估計前需要嘅最少觀測數
     mle_window : int
         rolling MLE 嘅 window size（建議 200-500）
+    theta : float
+        OU mean reversion 強度（0 = pure local level，1 = 完全跟 mean）。
+        建議 0.05-0.10：每 bar 朝長期 mean 收斂 5-10%。
+    long_term_alpha : float
+        長期 mean EMA 係數。0.005 ≈ 200-bar half-life，
+        即「長期」=過去幾百 bar 嘅平均水平。
     """
 
-    def __init__(self, warm_up: int = 100, mle_window: int = 300) -> None:
+    def __init__(
+        self,
+        warm_up: int = 100,
+        mle_window: int = 300,
+        theta: float = 0.05,
+        long_term_alpha: float = 0.005,
+    ) -> None:
         self.warm_up = warm_up
         self.mle_window = mle_window
+        self.theta = theta
+        self.long_term_alpha = long_term_alpha
 
         # Kalman state
-        self._x: Optional[float] = None   # x̂_{t|t}
+        self._x: Optional[float] = None   # x̂_{t|t}（短期 fair value）
         self._P: float = 1.0              # P_{t|t}
         self._Q: float = 1e-4             # initial guess
         self._R: float = 1e-2             # initial guess
+
+        # 長期 mean（slow EMA，OU drift 嘅錨點）
+        self._long_term_mean: Optional[float] = None
 
         # buffer for MLE
         self._obs: Deque[float] = deque(maxlen=mle_window)
@@ -125,18 +152,33 @@ class KalmanZScore:
         """
         接受新 microprice 觀測值，返回 z-score。
         前 warm_up 個 bar 返回 None（尚未 warm up）。
+
+        Predict step 加 OU drift：
+          x_pred = x + θ × (μ - x)   ← 朝長期 mean 收斂
+        innovation 因此反映「price 偏離 mean-reverting fair value」嘅程度，
+        而唔係單純「偏離 short-term Kalman level」。
         """
         self._obs.append(y)
         self._n += 1
 
-        # 初始化
+        # 更新長期 mean（slow EMA，每 bar 都更新）
+        if self._long_term_mean is None:
+            self._long_term_mean = y
+        else:
+            self._long_term_mean = (
+                (1 - self.long_term_alpha) * self._long_term_mean
+                + self.long_term_alpha * y
+            )
+
+        # 初始化 Kalman state
         if self._x is None:
             self._x = y
             self._P = self._R
             return None
 
-        # Predict
-        x_pred = self._x
+        # Predict（含 OU drift：x 朝 long_term_mean 收斂）
+        drift = self.theta * (self._long_term_mean - self._x)
+        x_pred = self._x + drift
         P_pred = self._P + self._Q
 
         # Innovation
@@ -150,7 +192,7 @@ class KalmanZScore:
         self._x = x_pred + K * innov
         self._P = (1 - K) * P_pred
 
-        # Rolling MLE（每 50 步更新一次，唔係每步，省 CPU）
+        # Rolling MLE（每 50 步更新一次）
         if self._n % 50 == 0:
             self._mle_update_qr()
 
@@ -159,6 +201,11 @@ class KalmanZScore:
 
         z = innov / math.sqrt(max(S, 1e-12))
         return z
+
+    @property
+    def long_term_mean(self) -> Optional[float]:
+        """長期 mean（OU drift 嘅錨點）。可用於 sanity check 同 diag log。"""
+        return self._long_term_mean
 
     @property
     def fair_value(self) -> Optional[float]:
