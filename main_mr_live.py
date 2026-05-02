@@ -42,6 +42,7 @@ import logging
 import os
 import sys
 import time
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 # ── sys.path 修正 ──────────────────────────────────────────────────────────
