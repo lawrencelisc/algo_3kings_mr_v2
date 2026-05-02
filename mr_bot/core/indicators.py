@@ -200,6 +200,15 @@ class KalmanZScore:
             return None
 
         z = innov / math.sqrt(max(S, 1e-12))
+
+        # OU 冷啟動保護：long_term_mean 需要約 1/alpha bars 才收斂。
+        # alpha=0.005 → ~200 bars。前 200 bars 的 z 可能因 LTM 偏差被極度誇大
+        # （實測見 BCH z=21.28），用 clamp 防止誤觸發極端入場。
+        # clamp 係 hard limit，唔影響收斂後的正常 z 分布（正常 z 落在 ±4 以內）。
+        ltm_warmup_bars = int(1.0 / max(self.long_term_alpha, 1e-9))
+        if self._n < self.warm_up + ltm_warmup_bars:
+            z = max(-4.0, min(z, 4.0))
+
         return z
 
     @property

@@ -73,6 +73,7 @@ from mr_bot.bot import MeanReversionBot, BotConfig
 from mr_bot.core.indicators import microprice, variance_ratio, half_life_ou
 from mr_bot.core.regime import screen_coin
 from mr_bot.core.cooldown import CooldownManager
+from mr_bot.core.jail import SymbolJail
 from mr_bot.core.risk import CorrelationGuard, DrawdownThrottle
 
 logging.basicConfig(
@@ -1153,6 +1154,30 @@ def main() -> None:
         "RegimePauseGuard: sl_threshold=%d/24h → pause=%.0fh",
         regime_pause.sl_threshold, regime_pause.pause_hours,
     )
+
+    # ── SymbolJail（自動長期坐監，取代人手 MR_EXCLUDE_SYMBOLS）────────────────
+    # 入監：cooldown 累犯 / SL streak / 滾動 PnL 任一觸發 → 7d 監禁
+    # 釋放：坐滿 7d 後逐日 check（VR<0.9 + HL≤2×timeout 才放）；
+    #       唔達標延長 1d；硬上限 30d 後強制釋放並 WARNING。
+    jail = SymbolJail(
+        jail_cooldown_count = int(os.environ.get("MR_JAIL_COOLDOWN_COUNT", "3")),
+        jail_sl_streak      = int(os.environ.get("MR_JAIL_SL_STREAK", "5")),
+        jail_pnl_lookback   = int(os.environ.get("MR_JAIL_PNL_LOOKBACK", "10")),
+        jail_pnl_threshold  = float(os.environ.get("MR_JAIL_PNL_THRESHOLD", "-0.5")),
+        jail_min_days       = float(os.environ.get("MR_JAIL_MIN_DAYS", "7.0")),
+        jail_max_days       = float(os.environ.get("MR_JAIL_MAX_DAYS", "30.0")),
+        vr_release_threshold = float(os.environ.get("MR_JAIL_VR_RELEASE", "0.9")),
+        hl_release_max_mult  = float(os.environ.get("MR_JAIL_HL_MULT", "2.0")),
+        timeout_bars        = timeout_bars,
+        state_path          = os.environ.get("MR_JAIL_FILE", "jail_state.json"),
+    )
+    logger.info(
+        "SymbolJail: cooldown≥%d/7d | streak≥%d | PnL<%.2f → %.0fd jail (max %.0fd)",
+        jail.jail_cooldown_count, jail.jail_sl_streak,
+        jail.jail_pnl_threshold, jail.jail_min_sec / 86400,
+        jail.jail_max_sec / 86400,
+    )
+    jail.log_status()
     ex  = _make_exchange()
     ex.load_markets()
 
@@ -1187,9 +1212,9 @@ def main() -> None:
         symbols_raw = os.environ.get("MR_SYMBOLS", DEFAULT_SYMBOLS)
         symbols     = [s.strip() for s in symbols_raw.split(",") if s.strip()]
 
-    # ── MR_EXCLUDE_SYMBOLS：暫時排除已確認 trending 主導的幣 ────────────────
-    # 格式：逗號分隔，例如 "COMP/USDC:USDC,BCH/USDC:USDC"
-    # 排除後唔影響已有持倉（持倉照常管理直到自然出場）
+    # ── MR_EXCLUDE_SYMBOLS：人手永久 ban（自動 jail 之上嘅最後保險）─────────
+    # 一般情況唔需要——SymbolJail 會自動處理 trending 幣。
+    # 留呢個係俾 ops 緊急情況用（例如某幣交易所有 bug，硬 ban 唔受 jail 釋放邏輯影響）。
     exclude_raw = os.environ.get("MR_EXCLUDE_SYMBOLS", "").strip()
     excluded_set: set = set()
     if exclude_raw:
@@ -1197,9 +1222,20 @@ def main() -> None:
         before_count = len(symbols)
         symbols = [s for s in symbols if s not in excluded_set]
         logger.warning(
-            "MR_EXCLUDE_SYMBOLS: removed %d symbol(s) from universe: %s",
+            "MR_EXCLUDE_SYMBOLS（人手永久 ban）: removed %d symbol(s): %s",
             before_count - len(symbols),
-            sorted(excluded_set & {s for s in excluded_set}),
+            sorted(excluded_set),
+        )
+
+    # ── SymbolJail：自動坐監過濾（重啟時恢復）──────────────────────────────
+    # 持久化嘅 jail 狀態優先於初始 symbols / universe scan。
+    # 坐監期間幣種唔會出現喺 active list（避免浪費 warmup + API quota）。
+    jailed_at_start = [s for s in symbols if jail.is_jailed(s)]
+    if jailed_at_start:
+        symbols = [s for s in symbols if not jail.is_jailed(s)]
+        logger.warning(
+            "SymbolJail（持久化恢復）: 過濾 %d 隻坐監幣: %s",
+            len(jailed_at_start), jailed_at_start,
         )
 
     logger.info("Active symbols (%d): %s", len(symbols), symbols)
@@ -1244,6 +1280,38 @@ def main() -> None:
                 vr_snapshot[_sym] = (_h * 2.0) if _h is not None else None
             regime_pause.check_resume(vr_snapshot)
 
+        # ── SymbolJail Release Check（每輪 check 所有坐監幣）────────────────
+        # 注意：坐監幣唔在 symbols list 入面（無 hurst_val 更新），所以要用獨立
+        # 機制取得 VR / HL —— 用 prices_cache（如果有）或 fetch 一次 OHLCV。
+        # 大部分情況坐監幣都係之前活躍過，prices_cache 仍有舊資料。
+        # 若 prices_cache 冇，jail 內部會延長 1d 等下次有資料先 release。
+        for _jsym in jail.all_jailed():
+            _vr = None
+            _hl = None
+            _pc = prices_cache.get(_jsym)
+            if _pc and len(_pc) >= 200:
+                try:
+                    _vr = variance_ratio(_pc, q=5)
+                    _hl = half_life_ou(_pc)
+                except Exception:
+                    pass
+            released = jail.check_release(_jsym, _vr, _hl)
+            if released and _jsym not in symbols and _jsym not in excluded_set:
+                # 釋放後加返入 active list（warmup 已有歷史 cache，可以直接交易）
+                if _jsym in ohlcv_cache and len(ohlcv_cache[_jsym]) >= 200:
+                    symbols.append(_jsym)
+                    logger.info(
+                        "SymbolJail: %s released → re-added to active universe",
+                        _jsym,
+                    )
+                else:
+                    # 重啟後可能無 cache → 等下次 universe rescan 再撈
+                    logger.info(
+                        "SymbolJail: %s released but no warm-up cache → "
+                        "will be picked up by next universe rescan",
+                        _jsym,
+                    )
+
         # ── Periodic Universe Rescan ────────────────────────────────────────
         if universe_scan and (loop_start - last_universe_scan_ts) >= universe_rescan_sec:
             logger.info("Scheduled universe rescan …")
@@ -1255,6 +1323,24 @@ def main() -> None:
                 min_atr_bps=universe_min_atr_bps,
             )
             if new_symbols:
+                # 過濾人手 ban + 自動 jail 嘅幣（即使 universe scan 揀到都唔加返）
+                _filtered_jail = [s for s in new_symbols if jail.is_jailed(s)]
+                _filtered_excl = [s for s in new_symbols if s in excluded_set]
+                if _filtered_jail:
+                    logger.info(
+                        "Universe rescan: skip %d jailed symbols: %s",
+                        len(_filtered_jail), _filtered_jail,
+                    )
+                if _filtered_excl:
+                    logger.info(
+                        "Universe rescan: skip %d MR_EXCLUDE_SYMBOLS: %s",
+                        len(_filtered_excl), _filtered_excl,
+                    )
+                new_symbols = [
+                    s for s in new_symbols
+                    if not jail.is_jailed(s) and s not in excluded_set
+                ]
+
                 added   = [s for s in new_symbols if s not in symbols]
                 removed = [s for s in symbols if s not in new_symbols]
 
@@ -1373,25 +1459,54 @@ def main() -> None:
                 prices_for_screen=prices_cache[sym] if len(prices_cache[sym]) >= 200 else None,
             )
 
-            # ── SL → 觸發 per-symbol cooldown + global RegimePauseGuard ────
-            if rec is not None and rec.reason == "SL":
-                triggered = cooldown.record_sl(sym)
-                if triggered:
-                    rem_h = cooldown.remaining_sec(sym) / 3600
-                    logger.warning(
-                        "🚫 %s 進入 cooldown %.1fh（24h 第 %d 次 SL）",
-                        sym, rem_h, cooldown.sl_count_24h(sym),
-                    )
-                # 每次 SL 都通知 global 熔斷計數（唔管 per-symbol cooldown 是否觸發）
-                regime_pause.record_sl(sym)
+            # ── 出場後分流：SL → cooldown + RegimePauseGuard + jail ────────
+            #   TP / DECEL → jail.observe_win（reset SL streak）
+            #   TIMEOUT / REGIME_RED → jail.observe_neutral_exit（記 PnL 唔 reset）
+            if rec is not None:
+                if rec.reason == "SL":
+                    triggered = cooldown.record_sl(sym)
+                    if triggered:
+                        rem_h = cooldown.remaining_sec(sym) / 3600
+                        logger.warning(
+                            "🚫 %s 進入 cooldown %.1fh（24h 第 %d 次 SL）",
+                            sym, rem_h, cooldown.sl_count_24h(sym),
+                        )
+                        # cooldown 觸發後通知 jail（累計 7d 內次數）
+                        jailed_now = jail.observe_cooldown_trigger(sym)
+                        if jailed_now and sym in symbols:
+                            symbols.remove(sym)
+                            logger.warning(
+                                "🔒 %s 入監 → 從 active universe 移除",
+                                sym,
+                            )
+                    # 每次 SL 都通知 global 熔斷計數
+                    regime_pause.record_sl(sym)
+                    # 同時通知 jail（streak / PnL 軌道）
+                    jailed_now = jail.observe_sl(sym, rec.net_pnl)
+                    if jailed_now and sym in symbols:
+                        symbols.remove(sym)
+                        logger.warning(
+                            "🔒 %s 入監 → 從 active universe 移除",
+                            sym,
+                        )
+                elif rec.reason in ("TP", "DECEL"):
+                    jail.observe_win(sym, rec.net_pnl)
+                else:
+                    # TIMEOUT / REGIME_RED / 其他
+                    jail.observe_neutral_exit(sym, rec.net_pnl)
 
             if not paper:
                 _st_after = bot.get_state(sym)
 
                 # ── 新開倉：bot 剛剛由無倉 → 有倉 ──────────────────────────
                 if not _was_in_pos and _st_after.in_position:
-                    # 若全局熔斷啟動，取消開倉（唔落 entry order）
-                    if regime_pause.is_paused():
+                    # 防禦性檢查（坐監幣理應已從 symbols 移除）
+                    if jail.is_jailed(sym):
+                        logger.warning(
+                            "JAIL  %s  new entry blocked — 坐監中 [%s]",
+                            sym, jail.status_dict(sym).get("trigger", "unknown"),
+                        )
+                    elif regime_pause.is_paused():
                         logger.warning(
                             "REGIME_PAUSE  %s  new entry blocked — "
                             "global SL熔斷中（%.1fh remaining, 24h_SL=%d）",
@@ -1409,6 +1524,7 @@ def main() -> None:
         if int(loop_start) % 600 < int(poll_sec):
             s = bot.summary()
             cooling_list = cooldown.all_cooling()
+            jailed_list  = jail.all_jailed()
             pause_str = (
                 f"PAUSED {regime_pause.remaining_hours():.1f}h "
                 f"(24h_SL={regime_pause.sl_count_24h()})"
@@ -1418,13 +1534,14 @@ def main() -> None:
             logger.info(
                 "SUMMARY  equity=%.2f  pnl=%+.4f  trades=%d  "
                 "win_rate=%.1f%%  PF=%.3f  fee_paid=%.4f  "
-                "dd=%s  regime=%s  cooling=%s",
+                "dd=%s  regime=%s  cooling=%s  jailed=%s",
                 s["equity"], s["pnl"], s["trades"],
                 s.get("win_rate", 0), s.get("profit_factor", 0),
                 s.get("total_fee_paid", 0),
                 dd_throttle.status_str(),
                 pause_str,
                 cooling_list if cooling_list else "none",
+                jailed_list if jailed_list else "none",
             )
 
         # ── Sleep ────────────────────────────────────────────────────────────
