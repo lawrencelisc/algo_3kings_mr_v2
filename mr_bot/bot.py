@@ -594,12 +594,13 @@ class MeanReversionBot:
             else:
                 _hl_max = _max_mult
             if size_mult > _hl_max:
+                _orig_mult = size_mult
                 notional = base_notional * _hl_max
                 size = notional / max(fill_price, 1e-9)
                 size_mult = _hl_max
                 logger.info(
-                    "HL_SIZE_CAP  %s  HL=%.1f bars → size_mult capped %.2f× → %.2f×  notional=%.2f",
-                    symbol, _hl, notional / max(base_notional, 1e-9), size_mult, notional,
+                    "HL_SIZE_CAP  %s  HL=%.1f bars → size_mult %.2f× → %.2f×  notional=%.2f",
+                    symbol, _hl, _orig_mult, size_mult, notional,
                 )
 
         # 扣開倉手續費
