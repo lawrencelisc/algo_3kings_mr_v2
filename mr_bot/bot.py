@@ -580,6 +580,28 @@ class MeanReversionBot:
                 symbol, _max_mult, notional,
             )
 
+        # ── ROUND4: half-life based size cap ─────────────────────────────
+        # 慢速 MR（HL 長）持倉期間 regime 惡化風險高，縮倉保護資本：
+        #   HL ≤ 30 bars → 保持 _max_mult（快速 MR，Kelly 可信）
+        #   30 < HL ≤ 60 bars → 上限 1.5×
+        #   HL > 60 bars → 上限 1.0×（slow MR，regime 視窗太短）
+        _hl = state.half_life_bars
+        if _hl is not None:
+            if _hl > 60:
+                _hl_max = 1.0
+            elif _hl > 30:
+                _hl_max = 1.5
+            else:
+                _hl_max = _max_mult
+            if size_mult > _hl_max:
+                notional = base_notional * _hl_max
+                size = notional / max(fill_price, 1e-9)
+                size_mult = _hl_max
+                logger.info(
+                    "HL_SIZE_CAP  %s  HL=%.1f bars → size_mult capped %.2f× → %.2f×  notional=%.2f",
+                    symbol, _hl, notional / max(base_notional, 1e-9), size_mult, notional,
+                )
+
         # 扣開倉手續費
         entry_fee = self.account.deduct_entry_fee(notional, is_maker=is_maker)
 
