@@ -863,10 +863,26 @@ def _live_place_entry(
             if oid and _live_wait_fill(ex, symbol, oid):
                 _live_place_bracket(ex, symbol, state)
             else:
-                logger.warning(
-                    "LIVE_ENTRY SHORT %s postOnly not filled → bracket skipped "
-                    "(internal SL/TP active)", symbol,
-                )
+                # Timeout or not filled — MUST cancel the resting order to
+                # prevent an unmanaged "orphan" position if price later drifts
+                # back to the limit price with no bracket orders in place.
+                if oid:
+                    try:
+                        ex.cancel_order(oid, symbol)
+                        logger.warning(
+                            "LIVE_ENTRY SHORT %s postOnly timeout → cancelled "
+                            "entry order %s (no orphan risk)", symbol, oid,
+                        )
+                    except Exception as _ce:
+                        logger.warning(
+                            "LIVE_ENTRY SHORT %s postOnly timeout → cancel "
+                            "failed for %s: %s (check manually)", symbol, oid, _ce,
+                        )
+                else:
+                    logger.warning(
+                        "LIVE_ENTRY SHORT %s postOnly not filled, no oid → "
+                        "nothing to cancel", symbol,
+                    )
             return
         except ccxt.InvalidOrder as e:
             logger.info(
