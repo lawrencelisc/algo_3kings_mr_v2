@@ -491,6 +491,19 @@ class MeanReversionBot:
             return
         self._gate_stats["g4_z_thresh"] += 1
 
+        # ── ROUND5: Strict Hurst gate（防 stale eligibility）─────────────
+        # coin_rescreen_interval_bars 過長（30 bars），state.hurst_val 可能漂高
+        # 至隨機遊走區（h_equiv ≥ 0.5）但 state.eligible 仍 cache 為 True。
+        # 入場前最後一道閘：state.hurst_val 必須 < hurst_threshold（嚴格 0.45），
+        # 否則即使 state.eligible=True 都 skip，避免喺隨機區 entry。
+        _hurst = state.hurst_val
+        if _hurst is not None and _hurst >= self.config.hurst_threshold:
+            logger.info(
+                "HURST_STRICT  %s %s  H_eq=%.3f >= %.2f → skip entry (stale eligibility)",
+                side.upper(), symbol, _hurst, self.config.hurst_threshold,
+            )
+            return
+
         # SL 冷卻期：止損後唔可以即刻重入（防接刀 / 連輸）
         if state.bar_count < state.sl_cooldown_until_bar:
             logger.info(
@@ -602,6 +615,27 @@ class MeanReversionBot:
                     "HL_SIZE_CAP  %s  HL=%.1f bars → size_mult %.2f× → %.2f×  notional=%.2f",
                     symbol, _hl, _orig_mult, size_mult, notional,
                 )
+
+        # ── ROUND5: VPIN-based size cap ──────────────────────────────────
+        # VPIN_pct 高 = toxic flow 重，距離 regime RED（>80）只一步之遙；
+        # 即使 H/HL 靚，呢個時候大倉等於賭 regime 唔轉紅，期望值差。
+        #   VPIN ≥ 80 → 上限 1.0×（regime RED 邊界，唔好放大）
+        #   75 ≤ VPIN < 80 → 上限 1.5×
+        if vpin_pct >= 80:
+            _vpin_max = 1.0
+        elif vpin_pct >= 75:
+            _vpin_max = 1.5
+        else:
+            _vpin_max = _max_mult
+        if size_mult > _vpin_max:
+            _orig_mult = size_mult
+            notional = base_notional * _vpin_max
+            size = notional / max(fill_price, 1e-9)
+            size_mult = _vpin_max
+            logger.info(
+                "VPIN_SIZE_CAP  %s  VPIN=%.0f%% → size_mult %.2f× → %.2f×  notional=%.2f",
+                symbol, vpin_pct, _orig_mult, size_mult, notional,
+            )
 
         # 扣開倉手續費
         entry_fee = self.account.deduct_entry_fee(notional, is_maker=is_maker)
