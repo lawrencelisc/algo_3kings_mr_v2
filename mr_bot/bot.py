@@ -151,6 +151,17 @@ class BotConfig:
     hl_slack: float = 1.5
     coin_rescreen_interval_bars: int = 30   # 每 30 bars 重新 screen（120s bar → 60min）
 
+    # ROUND5: 入場時嘅嚴格 Hurst 閾值（與 universe filter 解耦）
+    # universe_relax_hurst（傳入 hurst_threshold）可放寬到 0.55 揀池，
+    # 但實際入場必須通過呢個更嚴格嘅閘，避免喺隨機區（h>=0.45）入場。
+    hurst_strict_threshold: float = 0.45
+
+    # ROUND5: 極端 z 入場保護
+    # |z| 越大，越可能係 trending breakout 而非 MR 機會：
+    # 要求 Hurst 嚴格 < extreme_z_hurst_max 才能入場，否則 skip。
+    extreme_z_threshold: float = 3.0
+    extreme_z_hurst_max: float = 0.40
+
     # Timeout（分 bar 計）
     timeout_bars: int = 30
 
@@ -492,17 +503,34 @@ class MeanReversionBot:
         self._gate_stats["g4_z_thresh"] += 1
 
         # ── ROUND5: Strict Hurst gate（防 stale eligibility）─────────────
-        # coin_rescreen_interval_bars 過長（30 bars），state.hurst_val 可能漂高
-        # 至隨機遊走區（h_equiv ≥ 0.5）但 state.eligible 仍 cache 為 True。
-        # 入場前最後一道閘：state.hurst_val 必須 < hurst_threshold（嚴格 0.45），
-        # 否則即使 state.eligible=True 都 skip，避免喺隨機區 entry。
+        # universe scan 用 hurst_threshold（可放寬至 0.55 揀池），但 live entry
+        # 必須通過 hurst_strict_threshold（預設 0.45）— 兩者解耦，避免喺
+        # 隨機區（h_equiv ≥ 0.45）入場。state.hurst_val 由 30 bars 一次嘅
+        # re-screen 更新，可能 stale，呢度作為最後一道閘。
         _hurst = state.hurst_val
-        if _hurst is not None and _hurst >= self.config.hurst_threshold:
+        _strict = self.config.hurst_strict_threshold
+        if _hurst is not None and _hurst >= _strict:
             logger.info(
-                "HURST_STRICT  %s %s  H_eq=%.3f >= %.2f → skip entry (stale eligibility)",
-                side.upper(), symbol, _hurst, self.config.hurst_threshold,
+                "HURST_STRICT  %s %s  H_eq=%.3f >= %.2f → skip entry (stale/weak MR)",
+                side.upper(), symbol, _hurst, _strict,
             )
             return
+
+        # ── ROUND5: Extreme z gate ───────────────────────────────────────
+        # |z| 極大（≥ extreme_z_threshold，預設 3.0σ）通常係 trending
+        # breakout 而非 MR 機會：在 H 邊緣嘅幣，呢類入場係「接刀」。
+        # 只有 H 嚴格細於 extreme_z_hurst_max（預設 0.40）才允許入場。
+        _z_thr = self.config.extreme_z_threshold
+        _z_h_max = self.config.extreme_z_hurst_max
+        if abs(z) >= _z_thr:
+            if _hurst is None or _hurst >= _z_h_max:
+                logger.info(
+                    "EXTREME_Z  %s %s  |z|=%.2f >= %.2f  H=%s >= %.2f → skip entry",
+                    side.upper(), symbol, abs(z), _z_thr,
+                    f"{_hurst:.3f}" if _hurst is not None else "None",
+                    _z_h_max,
+                )
+                return
 
         # SL 冷卻期：止損後唔可以即刻重入（防接刀 / 連輸）
         if state.bar_count < state.sl_cooldown_until_bar:

@@ -1169,6 +1169,10 @@ def main() -> None:
         bar_duration_sec=poll_sec,
         csv_path=csv_path,
         hurst_threshold=universe_relax_hurst,
+        hurst_strict_threshold=float(os.environ.get("MR_HURST_STRICT", "0.45")),
+        extreme_z_threshold=float(os.environ.get("MR_EXTREME_Z", "3.0")),
+        extreme_z_hurst_max=float(os.environ.get("MR_EXTREME_Z_HURST", "0.40")),
+        coin_rescreen_interval_bars=int(os.environ.get("MR_RESCREEN_BARS", "30")),
         max_size_mult=float(os.environ.get("MR_MAX_SIZE_MULT", "3.0")),
         sizing_config=_SizingConfig(
             min_fraction=min_fraction,
@@ -1178,6 +1182,13 @@ def main() -> None:
     logger.info(
         "VR threshold aligned: screen_coin uses VR<%.2f (from MR_UNIVERSE_RELAX_HURST=%.2f)",
         universe_relax_hurst * 2.0, universe_relax_hurst,
+    )
+    logger.info(
+        "Entry gates: hurst_strict<%.2f  extreme_z>=%.1f requires H<%.2f  rescreen=%d bars",
+        config.hurst_strict_threshold,
+        config.extreme_z_threshold,
+        config.extreme_z_hurst_max,
+        config.coin_rescreen_interval_bars,
     )
     logger.info(
         "Sizing: equity=%.2f  min_frac=%.1f%%  max_frac=%.1f%%  "
