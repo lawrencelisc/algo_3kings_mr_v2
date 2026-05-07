@@ -1173,6 +1173,7 @@ def main() -> None:
         extreme_z_threshold=float(os.environ.get("MR_EXTREME_Z", "3.0")),
         extreme_z_hurst_max=float(os.environ.get("MR_EXTREME_Z_HURST", "0.40")),
         coin_rescreen_interval_bars=int(os.environ.get("MR_RESCREEN_BARS", "30")),
+        tp_r_multiple=float(os.environ.get("MR_TP_R", "1.5")),
         max_size_mult=float(os.environ.get("MR_MAX_SIZE_MULT", "3.0")),
         sizing_config=_SizingConfig(
             min_fraction=min_fraction,
@@ -1189,6 +1190,11 @@ def main() -> None:
         config.extreme_z_threshold,
         config.extreme_z_hurst_max,
         config.coin_rescreen_interval_bars,
+    )
+    logger.info(
+        "PHASE1: TP=entry±%.1f×base_sl  exit_reasons=[TP,REGIME_RED,SL,TIMEOUT]  "
+        "(DECEL+ADVERSE_FLOW removed)",
+        config.tp_r_multiple,
     )
     logger.info(
         "Sizing: equity=%.2f  min_frac=%.1f%%  max_frac=%.1f%%  "

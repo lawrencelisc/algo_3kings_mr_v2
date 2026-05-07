@@ -172,6 +172,12 @@ class BotConfig:
     # 嘅微利出場（fee × 2 已食晒），俾 mean reversion 至少 N bars 走完。
     decel_min_hold_bars: int = 3
 
+    # PHASE1: 固定 R:R TP（取代 Kalman fair_value floor）
+    # 舊邏輯：tp_price = max(fair_value, entry ± 0.5 × base_sl) → R:R 上限 0.5:1
+    # 新邏輯：tp_price = entry ± tp_r_multiple × base_sl → R:R 固定 1.5:1
+    # EV 數學：50% WR × 1.5R - 50% × 1R = +0.25R/trade（vs 舊 -0.25R）
+    tp_r_multiple: float = 1.5
+
     # SL config
     atr_mult: float = 1.0
     # SL bps 上下限（自適應跨幣種，唔需要 WFA）：
@@ -578,14 +584,20 @@ class MeanReversionBot:
             symbol, raw_sl_bps, sl_bps, base_sl,
         )
 
-        # TP price（Kalman fair value，即 mean reversion target）
-        tp_price = state.kalman.fair_value or mp
+        # PHASE1: 固定 R:R TP（取代 Kalman fair_value）
+        # 舊邏輯：tp = max(fair_value, entry ± 0.5×SL) → R:R 上限 0.5:1（無 EV）
+        # 新邏輯：tp = entry ± tp_r_multiple × SL（預設 1.5×）
+        # 喺 50% WR 假設下 EV = 0.5×1.5R - 0.5×1R = +0.25R per trade。
+        # 同時保留 min_tp_bps floor 防止超細幣 TP 細到等如冇。
+        tp_dist = self.config.tp_r_multiple * base_sl
+        min_tp_dist = self.config.min_tp_bps / 1e4 * fill_price
+        tp_dist = max(tp_dist, min_tp_dist)
         if side == "long":
             sl_price = fill_price - base_sl
-            tp_price = max(tp_price, fill_price + base_sl * 0.5)
+            tp_price = fill_price + tp_dist
         else:
             sl_price = fill_price + base_sl
-            tp_price = min(tp_price, fill_price - base_sl * 0.5)
+            tp_price = fill_price - tp_dist
 
         # Position size（quarter-Kelly + Hurst adjusted + drawdown throttle）
         notional = compute_position_size(
@@ -742,10 +754,14 @@ class MeanReversionBot:
                 base_new_sl = min(base_new_sl, trail_sl)
             state.sl_price = min(state.sl_price, base_new_sl)
 
-        # 檢查出場條件（優先順序：TP > REGIME_RED > SL > ADVERSE_FLOW > TIMEOUT > DECEL）
+        # PHASE1: 簡化出場（刪除 ADVERSE_FLOW + DECEL）
+        # 理由：
+        #   ADVERSE_FLOW — 3 日 36 筆從未觸發（threshold 太鬆 OR Lee-Ready 信號弱）
+        #   DECEL（z=±0.5 平倉）— 等如自我設限 R:R ≤ 1，係贏單嘅天花板
+        # 保留 4 種：TP > REGIME_RED > SL > TIMEOUT（優先順序）
         reason: Optional[str] = None
 
-        # TP
+        # TP（固定 R:R 1.5×base_sl，喺 _try_entry 已計）
         if side == "long" and close >= state.tp_price:
             reason = "TP"
         elif side == "short" and close <= state.tp_price:
@@ -762,30 +778,12 @@ class MeanReversionBot:
             elif side == "short" and close >= state.sl_price:
                 reason = "SL"
 
-        # Adverse Flow Exit
-        if reason is None:
-            adverse = state.adverse_flow.update(buy_flow, sell_flow, side)
-            if adverse:
-                reason = "ADVERSE_FLOW"
-
-        # Timeout
+        # Timeout：超過 timeout_bars 仍未達 TP/SL → maker exit
+        # 改 R:R 1.5 後 TP 會更慢觸發，timeout 應變得有意義
         if reason is None:
             bars_held = state.bar_count - state.entry_bar
             if bars_held >= self.config.timeout_bars:
                 reason = "TIMEOUT"
-
-        # DECEL（Z-score 回歸長期 mean，mean reversion 大致完成）
-        # OU-anchored Kalman 修正後：z 反映「price 偏離長期 mean 多少 σ」，
-        # 入場 z=±2 → DECEL z=±0.5 = 確實已完成 75% reversion。
-        # min_hold_bars guard：防止「入場後 1-2 bar 就 DECEL」嘅冇邊際 trade
-        # （fee × 2 已食晒 0.5σ 嘅 P&L）。
-        if reason is None and z is not None:
-            bars_held_check = state.bar_count - state.entry_bar
-            if bars_held_check >= self.config.decel_min_hold_bars:
-                if side == "long" and z >= -0.5:
-                    reason = "DECEL"
-                elif side == "short" and z <= 0.5:
-                    reason = "DECEL"
 
         if reason is None:
             return None
